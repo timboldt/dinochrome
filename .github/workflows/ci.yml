@@ -29,13 +29,16 @@ jobs:
       - name: Install Rust
         run: rustup toolchain install stable --profile minimal --component rustfmt,clippy
 
-      # bevy_gilrs (gamepad support) needs udev headers on Linux. ALSA headers
-      # are not strictly required — we build without the audio feature — but M5
-      # adds sound, so install them now rather than debugging it later.
+      # Bevy's `2d` feature collection implies `default_platform`, which turns on
+      # `wayland` and `x11` — so `wayland-sys` needs its headers at build time,
+      # and `bevy_gilrs` (gamepad support) needs udev's. ALSA is not strictly
+      # required yet, since we build without the audio feature, but M5 adds sound.
+      # This matches the default set in Bevy's own `install-linux-deps` action.
       - name: Install Linux build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install --no-install-recommends -y libasound2-dev libudev-dev
+          sudo apt-get install --no-install-recommends -y \
+            libasound2-dev libudev-dev libwayland-dev
 
       - uses: Swatinem/rust-cache@v2
 
@@ -60,10 +63,14 @@ jobs:
       - name: Install Rust
         run: rustup toolchain install stable --profile minimal --target wasm32-unknown-unknown
 
+      # Same set as the `check` job. Cross-compiling to wasm32 should not reach
+      # the Linux-only crates, but host build scripts can, and keeping the two
+      # jobs identical is worth more than the few seconds this costs.
       - name: Install Linux build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install --no-install-recommends -y libasound2-dev libudev-dev
+          sudo apt-get install --no-install-recommends -y \
+            libasound2-dev libudev-dev libwayland-dev
 
       - uses: Swatinem/rust-cache@v2
 
