@@ -1,0 +1,31 @@
+[package]
+name = "dinochrome-game"
+description = "Bevy front end for dinochrome: systems, components, rendering, input, audio."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "dinochrome"
+path = "src/main.rs"
+
+[dependencies]
+dinochrome-core.workspace = true
+
+# `2d` and `ui` are Bevy 0.19 feature collections; between them they pull in the
+# renderer, windowing, input, state and font support. `default-features = false`
+# drops the 3D and audio collections we have no use for. Note that `2d` already
+# implies `webgl2` (via `default_platform`) — we deliberately never enable
+# `webgpu`, which would override it and cut off browsers without WebGPU.
+[dependencies.bevy]
+version = "0.19"
+default-features = false
+features = ["2d", "ui"]
+
+# Browser API access (needed for the canvas, timers and input on wasm32).
+[target.'cfg(target_arch = "wasm32")'.dependencies.bevy]
+version = "0.19"
+default-features = false
+features = ["web"]

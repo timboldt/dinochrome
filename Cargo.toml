@@ -1,0 +1,35 @@
+[workspace]
+resolver = "3"
+members = ["crates/dinochrome-core", "crates/dinochrome-game"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/timboldt/dinochrome"
+
+[workspace.dependencies]
+dinochrome-core = { path = "crates/dinochrome-core" }
+# Pinned to the same glam major that bevy_math 0.19 uses, so `Vec2` is literally
+# the same type on both sides of the core/game boundary.
+glam = "0.32"
+
+# Bevy in a debug build is unusably slow unless its dependencies are optimized.
+# Our own crates stay at opt-level 0 so debugging and incremental builds stay fast.
+[profile.dev.package."*"]
+opt-level = 3
+
+# The release profile is tuned for the wasm bundle (the primary deployment
+# target); native release builds inherit the same settings, which is fine because
+# the fast native dev loop is a debug build.
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+# Deliberately NOT `strip = true`. Stripping removes the `target_features`
+# custom section, and without it wasm-opt assumes the MVP feature set and
+# rejects the bulk-memory instructions rustc now emits by default:
+#   "memory.copy operations require bulk memory operations".
+# wasm-opt -Oz drops the debug sections anyway, so nothing is gained by it.

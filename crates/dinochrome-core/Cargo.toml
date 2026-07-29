@@ -1,0 +1,13 @@
+[package]
+name = "dinochrome-core"
+description = "Engine-free simulation logic for dinochrome: grid math, maze generation, collision, LOS, pathfinding."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# This crate must never depend on bevy. Everything here has to be unit-testable
+# headlessly, without an App or a render context.
+[dependencies]
+glam.workspace = true
