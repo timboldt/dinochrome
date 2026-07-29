@@ -9,25 +9,29 @@ use bevy::input::keyboard::{Key, KeyboardInput, NativeKey};
 use bevy::input::{ButtonState, InputPlugin};
 use bevy::prelude::*;
 use bevy::state::app::StatesPlugin;
+use bevy::time::TimeUpdateStrategy;
 use dinochrome_game::player::{DriveCommand, Tank, Velocity};
 use dinochrome_game::{AppState, SimPlugin};
 
 /// A simulation-only app: everything `SimPlugin` needs and nothing else.
 fn headless_app() -> App {
     let mut app = App::new();
-    app.add_plugins((MinimalPlugins, StatesPlugin, InputPlugin, SimPlugin));
+    app.add_plugins((MinimalPlugins, StatesPlugin, InputPlugin, SimPlugin))
+        // Pin one fixed tick to one `App::update`. Without this, Bevy accrues
+        // fixed steps out of a wall-clock-driven virtual clock, so the number of
+        // `FixedUpdate` runs in a test would depend on how fast the machine is —
+        // on an idle machine a tight update loop can complete without the
+        // accumulator ever reaching a full timestep, and the simulation would
+        // silently never advance.
+        .insert_resource(TimeUpdateStrategy::FixedTimesteps(1));
     // One update to let plugin setup and the initial state transition settle.
     app.update();
     app
 }
 
-/// Steps the app, forcing `ticks` fixed updates to run regardless of wall-clock
-/// time, so the test does not depend on how fast the machine is.
+/// Runs exactly `ticks` simulation ticks.
 fn step(app: &mut App, ticks: u32) {
     for _ in 0..ticks {
-        app.world_mut().resource_mut::<Time<Fixed>>().advance_by(
-            std::time::Duration::from_secs_f64(1.0 / dinochrome_core::FIXED_HZ),
-        );
         app.update();
     }
 }
@@ -136,13 +140,16 @@ fn holding_d_drives_the_tank_right() {
     let start = tank_position(&mut app);
     press(&mut app, KeyCode::KeyD);
     step(&mut app, 60);
-    let moved = tank_position(&mut app);
+    let travelled = tank_position(&mut app) - start;
 
+    // One second of drive: a quarter second reaching 180 px/s, then holding it,
+    // so roughly 157 px. The floor is deliberately well above zero — asserting
+    // only `> 0` would be satisfied by a simulation that never ticked at all.
     assert!(
-        moved.x > start.x,
-        "expected rightward travel, got {moved:?}"
+        travelled.x > 100.0,
+        "expected about a second's travel to the right, got {travelled:?}"
     );
-    assert!((moved.y - start.y).abs() < 1e-4, "no drift on Y: {moved:?}");
+    assert!(travelled.y.abs() < 1e-4, "no drift on Y: {travelled:?}");
 }
 
 #[test]
@@ -150,6 +157,7 @@ fn the_tank_does_not_move_while_paused() {
     let mut app = headless_app();
     start_playing(&mut app);
 
+    let start = tank_position(&mut app);
     press(&mut app, KeyCode::KeyD);
     step(&mut app, 60);
     tap(&mut app, KeyCode::Escape);
@@ -157,6 +165,10 @@ fn the_tank_does_not_move_while_paused() {
 
     // D is still held down, but paused: nothing may advance.
     let paused_at = tank_position(&mut app);
+    assert!(
+        paused_at.x > start.x,
+        "the tank should have been moving before the pause"
+    );
     step(&mut app, 120);
     assert_eq!(tank_position(&mut app), paused_at);
 }
@@ -191,6 +203,11 @@ fn a_released_tank_coasts_to_a_dead_stop() {
 
     press(&mut app, KeyCode::KeyW);
     step(&mut app, 60);
+    assert!(
+        tank_position(&mut app).y > 100.0,
+        "the tank should have been moving before the controls were released"
+    );
+
     release(&mut app, KeyCode::KeyW);
     step(&mut app, 120);
 

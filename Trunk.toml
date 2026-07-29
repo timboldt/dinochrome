@@ -1,0 +1,19 @@
+[build]
+target = "index.html"
+dist = "dist"
+# GitHub Pages serves this project from a subpath (`/<repo>/`), so the release
+# build in CI passes `--public-url` explicitly. Local `trunk serve` runs at the
+# server root and wants the default.
+public_url = "/"
+
+[serve]
+port = 8080
+open = false
+
+# Pinned so local and CI builds are byte-for-byte comparable. The wasm-opt
+# version matters beyond reproducibility: the one trunk 0.21 ships by default
+# (binaryen 123) rejects the bulk-memory instructions current rustc emits for
+# wasm32 by default, failing validation with "memory.copy operations require
+# bulk memory operations".
+[tools]
+wasm_opt = "version_131"

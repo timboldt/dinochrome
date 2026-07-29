@@ -1,0 +1,187 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>dinochrome</title>
+    <meta
+      name="description"
+      content="A top-down 2D tank game — an homage to Jim Lane's 1982 Bolo and Keith Laumer's Dinochrome Brigade."
+    />
+
+    <link data-trunk rel="rust" href="crates/dinochrome-game/Cargo.toml" data-bin="dinochrome" data-wasm-opt="z" />
+    <link data-trunk rel="copy-dir" href="assets" />
+
+    <style>
+      :root {
+        --void: #080a08;
+        --phosphor: #59f273;
+        --phosphor-dim: #338c47;
+        --amber: #ffb833;
+      }
+
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        width: 100%;
+        height: 100%;
+        overflow: hidden;
+        background: var(--void);
+        color: var(--phosphor);
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      }
+
+      /* Fixed viewport-sized wrapper. Bevy's `fit_canvas_to_parent` sizes the
+         canvas to this element; because the wrapper's size comes from the
+         viewport rather than from its children, there is no resize feedback
+         loop between the two. */
+      #canvas-wrapper {
+        position: fixed;
+        inset: 0;
+        width: 100vw;
+        height: 100vh;
+      }
+
+      #dinochrome-canvas {
+        display: block;
+        width: 100%;
+        height: 100%;
+        outline: none;
+      }
+
+      #loading {
+        position: fixed;
+        inset: 0;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 1.25rem;
+        background: var(--void);
+        transition: opacity 0.35s ease-out;
+        z-index: 10;
+      }
+
+      #loading.done {
+        opacity: 0;
+        pointer-events: none;
+      }
+
+      #loading h1 {
+        margin: 0;
+        font-size: clamp(1.75rem, 7vw, 3.5rem);
+        letter-spacing: 0.35em;
+        /* Letter-spacing adds a trailing gap; pull it back so the word stays centred. */
+        text-indent: 0.35em;
+        color: var(--amber);
+        font-weight: 600;
+      }
+
+      #loading p {
+        margin: 0;
+        font-size: 0.875rem;
+        letter-spacing: 0.1em;
+        color: var(--phosphor-dim);
+      }
+
+      #loading-bar {
+        width: min(18rem, 60vw);
+        height: 2px;
+        background: #16241a;
+        overflow: hidden;
+      }
+
+      #loading-bar::after {
+        content: "";
+        display: block;
+        width: 40%;
+        height: 100%;
+        background: var(--phosphor);
+        animation: sweep 1.4s ease-in-out infinite;
+      }
+
+      @keyframes sweep {
+        0% {
+          transform: translateX(-100%);
+        }
+        100% {
+          transform: translateX(250%);
+        }
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        #loading-bar::after {
+          animation: none;
+          width: 100%;
+        }
+        #loading {
+          transition: none;
+        }
+      }
+
+      #loading.failed #loading-bar {
+        display: none;
+      }
+
+      #loading.failed p {
+        color: var(--amber);
+      }
+    </style>
+  </head>
+
+  <body>
+    <div id="canvas-wrapper">
+      <canvas id="dinochrome-canvas"></canvas>
+    </div>
+
+    <div id="loading" role="status" aria-live="polite">
+      <h1>DINOCHROME</h1>
+      <div id="loading-bar"></div>
+      <p id="loading-message">Loading armour&hellip; first visit downloads a few MB.</p>
+    </div>
+
+    <script>
+      // The bundle is multi-MB on a cold cache, so the loader stays up until the
+      // wasm module has actually started. Trunk fires `TrunkApplicationStarted`
+      // once init resolves; the polling fallback covers the case where that
+      // event name changes out from under us, by watching for Bevy resizing the
+      // canvas away from its 300x150 default.
+      (function () {
+        const loading = document.getElementById("loading");
+        const message = document.getElementById("loading-message");
+        const canvas = document.getElementById("dinochrome-canvas");
+        let finished = false;
+
+        function ready() {
+          if (finished) return;
+          finished = true;
+          clearInterval(poll);
+          // One frame of grace so the first rendered image is already on screen
+          // behind the overlay before it fades.
+          requestAnimationFrame(function () {
+            loading.classList.add("done");
+          });
+        }
+
+        function failed(detail) {
+          if (finished) return;
+          finished = true;
+          clearInterval(poll);
+          loading.classList.add("failed");
+          message.textContent = "Failed to load: " + detail;
+        }
+
+        window.addEventListener("TrunkApplicationStarted", ready);
+
+        const poll = setInterval(function () {
+          if (canvas.width > 300 || canvas.height > 150) ready();
+        }, 100);
+
+        window.addEventListener("error", function (event) {
+          failed((event.message || "unknown error") + " — check the browser console.");
+        });
+      })();
+    </script>
+  </body>
+</html>

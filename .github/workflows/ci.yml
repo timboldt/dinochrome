@@ -1,0 +1,115 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  TRUNK_VERSION: v0.21.14
+
+# Superseded pull-request runs are cancelled; runs on `main` are always allowed
+# to finish, because each one is a candidate deploy.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  check:
+    name: fmt · clippy · test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal --component rustfmt,clippy
+
+      # bevy_gilrs (gamepad support) needs udev headers on Linux. ALSA headers
+      # are not strictly required — we build without the audio feature — but M5
+      # adds sound, so install them now rather than debugging it later.
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y libasound2-dev libudev-dev
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace
+
+  # The wasm bundle is the primary deployment target, so it is built on every
+  # push and pull request — not only when deploying — so that it cannot quietly
+  # rot behind the native build.
+  build-wasm:
+    name: build wasm
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal --target wasm32-unknown-unknown
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y libasound2-dev libudev-dev
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Installed straight from the release tarball, pinned, rather than via a
+      # third-party action. trunk fetches its own wasm-bindgen and wasm-opt.
+      - name: Install trunk
+        run: |
+          curl -fsSL "https://github.com/trunk-rs/trunk/releases/download/${TRUNK_VERSION}/trunk-x86_64-unknown-linux-gnu.tar.gz" \
+            | sudo tar -xzf - -C /usr/local/bin trunk
+          trunk --version
+
+      # GitHub Pages serves this project from `https://<user>.github.io/<repo>/`,
+      # so every emitted URL needs the repository name as a prefix.
+      - name: Build
+        run: trunk build --release --public-url "/${{ github.event.repository.name }}/"
+
+      - name: Report bundle size
+        run: |
+          echo '### wasm bundle' >> "$GITHUB_STEP_SUMMARY"
+          ls -lh dist/*.wasm | awk '{ print "- `" $9 "` — " $5 }' >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+
+  deploy:
+    name: deploy to Pages
+    # Pull requests build the bundle but never publish it.
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    needs: [check, build-wasm]
+    runs-on: ubuntu-latest
+
+    # Cancelling a deploy mid-flight can leave the site half-published, so
+    # concurrent deploys queue rather than interrupt each other.
+    concurrency:
+      group: pages
+      cancel-in-progress: false
+
+    permissions:
+      pages: write
+      id-token: write
+
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
