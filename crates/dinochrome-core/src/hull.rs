@@ -7,8 +7,9 @@
 //! weight; it never overshoots, so releasing the controls settles at exactly
 //! zero instead of jittering around it.
 //!
-//! Position integration lives here too, but for M0 it is a plain Euler step.
-//! M1 replaces it with an axis-separated slide against the maze grid.
+//! This module only decides how fast the hull *wants* to go. Turning that into a
+//! new position is [`crate::collision::slide`]'s job, because the answer depends
+//! on the maze.
 
 use glam::Vec2;
 
@@ -65,11 +66,6 @@ pub fn step_velocity(vel: Vec2, drive: Vec2, params: HullParams, dt: f32) -> Vec
         params.accel
     };
     move_toward(vel, target, rate * dt)
-}
-
-/// Advances hull position by one tick.
-pub fn step_position(pos: Vec2, vel: Vec2, dt: f32) -> Vec2 {
-    pos + vel * dt
 }
 
 /// Moves `from` toward `to` by at most `max_delta`, landing exactly on `to`
@@ -184,17 +180,5 @@ mod tests {
     fn stepping_is_deterministic() {
         let drive = clamp_drive(Vec2::new(1.0, -0.25));
         assert_eq!(run(Vec2::ZERO, drive, 137), run(Vec2::ZERO, drive, 137));
-    }
-
-    #[test]
-    fn position_integrates_velocity_over_the_tick() {
-        let pos = step_position(Vec2::new(10.0, 5.0), Vec2::new(60.0, -120.0), FIXED_DT);
-        assert!((pos - Vec2::new(11.0, 3.0)).length() < 1e-4, "got {pos:?}");
-    }
-
-    #[test]
-    fn a_stationary_hull_does_not_move() {
-        let pos = Vec2::new(3.0, 4.0);
-        assert_eq!(step_position(pos, Vec2::ZERO, FIXED_DT), pos);
     }
 }

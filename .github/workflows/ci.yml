@@ -87,10 +87,21 @@ jobs:
       - name: Build
         run: trunk build --release --public-url "/${{ github.event.repository.name }}/"
 
+      # Both numbers, because they answer different questions. The raw size is
+      # dominated by Bevy and barely moves; the compressed size is what a player
+      # actually downloads, and is the one with a budget attached (< 6 MB — see
+      # plan.md). Pages serves compressed, so raw size alone is misleading.
       - name: Report bundle size
         run: |
           echo '### wasm bundle' >> "$GITHUB_STEP_SUMMARY"
-          ls -lh dist/*.wasm | awk '{ print "- `" $9 "` — " $5 }' >> "$GITHUB_STEP_SUMMARY"
+          for wasm in dist/*.wasm; do
+            raw=$(wc -c < "$wasm")
+            gz=$(gzip -9c "$wasm" | wc -c)
+            printf -- '- `%s` — %s raw, %s gzipped\n' \
+              "$(basename "$wasm")" \
+              "$(numfmt --to=iec-i --suffix=B "$raw")" \
+              "$(numfmt --to=iec-i --suffix=B "$gz")" >> "$GITHUB_STEP_SUMMARY"
+          done
 
       - uses: actions/upload-pages-artifact@v3
         with:

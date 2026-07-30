@@ -11,3 +11,4 @@ repository.workspace = true
 # headlessly, without an App or a render context.
 [dependencies]
 glam.workspace = true
+rand.workspace = true

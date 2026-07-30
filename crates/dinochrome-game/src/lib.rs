@@ -3,11 +3,14 @@
 //! The plugins are split so that the parts which decide *what happens* can run
 //! without a renderer:
 //!
-//! - [`SimPlugin`] — state machine, entities, input, fixed-timestep movement.
-//!   Runs headlessly on `MinimalPlugins`; this is what the smoke test drives.
+//! - [`SimPlugin`] — state machine, maze, entities, input, fixed-timestep
+//!   movement. Runs headlessly on `MinimalPlugins`; this is what the smoke test
+//!   drives.
 //! - [`PresentationPlugin`] — camera, sprites, UI overlays. Needs a renderer.
 //! - [`DinochromePlugin`] — both of the above; what `main` adds.
 
+pub mod camera;
+pub mod maze;
 pub mod menu;
 pub mod palette;
 pub mod player;
@@ -26,10 +29,17 @@ impl Plugin for SimPlugin {
     fn build(&self, app: &mut App) {
         app.insert_resource(Time::<Fixed>::from_hz(FIXED_HZ))
             .init_state::<AppState>()
-            // The tank outlives the pause state, so its lifetime is tied to
-            // leaving and re-entering the menu rather than to `Playing`. M4
-            // hands this over to level progression.
-            .add_systems(OnExit(AppState::MainMenu), player::spawn_tank)
+            .init_resource::<maze::MazeConfig>()
+            // The maze and the tank outlive the pause state, so their lifetime is
+            // tied to leaving and re-entering the menu rather than to `Playing`.
+            // M4 hands this over to level progression.
+            //
+            // Chained because the tank is placed on the maze's spawn cell: it
+            // cannot be created before the maze it stands in.
+            .add_systems(
+                OnExit(AppState::MainMenu),
+                (maze::generate, player::spawn_tank).chain(),
+            )
             .add_systems(OnEnter(AppState::MainMenu), player::despawn_tank)
             .add_systems(OnEnter(AppState::Paused), player::clear_drive_input)
             .add_systems(
@@ -65,15 +75,32 @@ pub struct PresentationPlugin;
 impl Plugin for PresentationPlugin {
     fn build(&self, app: &mut App) {
         app.insert_resource(ClearColor(palette::VOID))
-            .add_systems(Startup, spawn_camera)
+            .add_systems(Startup, camera::spawn)
             .add_systems(OnEnter(AppState::MainMenu), menu::spawn_main_menu)
             .add_systems(
                 OnExit(AppState::MainMenu),
-                menu::despawn_all::<menu::MainMenuUi>,
+                (
+                    despawn_all::<menu::MainMenuUi>,
+                    // Both of these read what the simulation just created, so
+                    // both have to be ordered against it explicitly — a
+                    // different plugin, but the same schedule.
+                    maze::render_walls.after(maze::generate),
+                    camera::snap_to_tank.after(player::spawn_tank),
+                ),
             )
+            .add_systems(OnEnter(AppState::MainMenu), despawn_all::<maze::MazeWall>)
             .add_systems(OnEnter(AppState::Paused), menu::spawn_pause_overlay)
-            .add_systems(OnExit(AppState::Paused), menu::despawn_all::<menu::PauseUi>)
-            .add_systems(Update, player::attach_tank_sprite);
+            .add_systems(OnExit(AppState::Paused), despawn_all::<menu::PauseUi>)
+            .add_systems(
+                Update,
+                (
+                    player::attach_tank_sprite,
+                    // Left running while paused so that a glide already in
+                    // flight settles instead of freezing half-way.
+                    camera::follow_tank
+                        .run_if(in_state(AppState::Playing).or_else(in_state(AppState::Paused))),
+                ),
+            );
     }
 }
 
@@ -86,7 +113,9 @@ impl Plugin for DinochromePlugin {
     }
 }
 
-/// M1 attaches this camera to the tank; for now it sits at the origin.
-fn spawn_camera(mut commands: Commands) {
-    commands.spawn(Camera2d);
+/// Despawns every entity carrying the marker `T`, along with its children.
+pub fn despawn_all<T: Component>(mut commands: Commands, entities: Query<Entity, With<T>>) {
+    for entity in &entities {
+        commands.entity(entity).despawn();
+    }
 }

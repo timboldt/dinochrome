@@ -11,7 +11,13 @@
 //!
 //! [`Vec2`]: glam::Vec2
 
+pub mod collision;
+pub mod grid;
 pub mod hull;
+pub mod maze;
+
+pub use grid::{CELL_SIZE, Cell, Grid};
+pub use maze::{Maze, MazeParams};
 
 /// Simulation tick rate, in hertz.
 ///
