@@ -73,10 +73,3 @@ pub fn spawn_pause_overlay(mut commands: Commands) {
         ],
     ));
 }
-
-/// Despawns every entity carrying the marker `T`, along with its children.
-pub fn despawn_all<T: Component>(mut commands: Commands, roots: Query<Entity, With<T>>) {
-    for entity in &roots {
-        commands.entity(entity).despawn();
-    }
-}

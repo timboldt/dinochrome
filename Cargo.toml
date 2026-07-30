@@ -14,6 +14,14 @@ dinochrome-core = { path = "crates/dinochrome-core" }
 # Pinned to the same glam major that bevy_math 0.19 uses, so `Vec2` is literally
 # the same type on both sides of the core/game boundary.
 glam = "0.32"
+# Default features off deliberately, and it buys two things. It keeps `getrandom`
+# out of the tree entirely, which matters because on wasm32 getrandom without a
+# backend is a *compile* error and the fix is a RUSTFLAGS incantation that trunk
+# and CI would both have to carry. And what is left is enough: `Xoshiro256PlusPlus`
+# needs no features, and unlike `StdRng` its algorithm is documented as stable
+# across releases and platforms — which is what makes a seed worth printing in a
+# bug report.
+rand = { version = "0.10", default-features = false }
 
 # Bevy in a debug build is unusably slow unless its dependencies are optimized.
 # Our own crates stay at opt-level 0 so debugging and incremental builds stay fast.
