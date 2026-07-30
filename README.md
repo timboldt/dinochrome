@@ -6,10 +6,11 @@ A top-down 2D tank game in Rust and [Bevy](https://bevy.org). You command a lone
 hover tank in a large procedurally generated maze, hunting down the drone
 factories hidden in it.
 
-**Status: M1 (maze).** A procedurally generated maze, a tank that drives around
-it and slides along its walls, and a camera that follows. The menu/playing/paused
-states work, and the same build runs in a browser and deploys to GitHub Pages.
-There is no combat and no enemy yet — see `plan.md` for the milestone list.
+**Status: M2 (combat).** A procedurally generated maze, a tank that drives around
+it and slides along its walls, a turret that aims independently of the hull, and a
+gun. Scattered through the maze are drone factories: destroy all of them and the
+sector is clear. The factories do not fight back yet — drones are M3 — so see
+`plan.md` for the milestone list.
 
 Each run generates a fresh maze and logs the seed it came from:
 
@@ -36,9 +37,15 @@ original where the 1982 version was working around hardware limits.
 | Key | Action |
 | --- | --- |
 | `W` `A` `S` `D` | Drive the hull |
+| Arrow keys | Aim the turret |
+| `Space` | Fire (hold; the gun's cooldown is the rate limit) |
 | `Enter` / `Space` | Start (from the menu) |
 | `Esc` | Pause / resume |
 | `Q` | Abandon the run (while paused) |
+
+The arrow keys aim at an absolute bearing rather than rotating the turret left and
+right, which is the same control as a gamepad's right stick — so twin-stick support
+in M5 is a binding rather than a second control scheme.
 
 ## Building
 
@@ -110,6 +117,17 @@ Collision is a circle against the grid's squares, resolved one axis at a time,
 which is where wall sliding and corner rounding come from. Long moves are split
 into half-cell substeps, so nothing tunnels through a wall no matter how fast it
 is going and callers never have to clamp a velocity.
+
+Shells do not slide — they stop dead on the first thing they touch — so they get
+their own routine, which solves for the impact point rather than stepping up to it.
+That makes a shell exact at any speed, and it is why the design is free to make one
+as fast as it likes.
+
+Factories are buildings standing in open cells, so they are not part of the grid at
+all: they are round obstacles handed to the collision layer alongside it. One is
+wide enough to plug a one-cell corridor, so where they may stand is not a free
+choice — the generator only places a factory on a cell the rest of the maze does not
+route through, which is what keeps every factory reachable and the level winnable.
 
 ## Licence
 

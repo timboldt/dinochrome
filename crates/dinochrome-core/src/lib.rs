@@ -13,8 +13,11 @@
 
 pub mod collision;
 pub mod grid;
+pub mod health;
 pub mod hull;
 pub mod maze;
+pub mod turret;
+pub mod weapon;
 
 pub use grid::{CELL_SIZE, Cell, Grid};
 pub use maze::{Maze, MazeParams};

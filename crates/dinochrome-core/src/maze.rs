@@ -20,6 +20,11 @@
 //! cell it becomes necessarily joins the one existing component. `is_connected`
 //! is asserted in tests over many seeds, but no generated maze depends on the
 //! check passing.
+//!
+//! Factory placement is the one part that does need the check. A factory is a
+//! building wide enough to plug a one-cell corridor, so putting one on a cell the
+//! rest of the maze depends on would wall a region off — see [`pick_factories`]
+//! for how that is ruled out.
 
 use glam::IVec2;
 use rand::seq::SliceRandom;
@@ -47,6 +52,12 @@ pub struct MazeParams {
     /// higher request is silently met with the densest maze available — see
     /// [`Maze::wall_density`] for what a maze actually ended up at.
     pub density: f32,
+    /// How many drone factories to place.
+    ///
+    /// A ceiling rather than a promise: a maze too cramped to hold this many
+    /// without walling itself off gets as many as fit. [`Maze::factories`] is what
+    /// a level actually got.
+    pub factories: i32,
 }
 
 impl MazeParams {
@@ -55,6 +66,7 @@ impl MazeParams {
         cols: 33,
         rows: 25,
         density: 0.34,
+        factories: 4,
     };
 
     /// Clamps the dimensions to what the carve can actually work with.
@@ -68,6 +80,7 @@ impl MazeParams {
             cols: self.cols.max(MIN_SPAN) | 1,
             rows: self.rows.max(MIN_SPAN) | 1,
             density: self.density.clamp(0.0, 1.0),
+            factories: self.factories.max(0),
         }
     }
 }
@@ -85,6 +98,12 @@ pub struct Maze {
     pub grid: Grid,
     /// Cell the player's tank starts in. Always open.
     pub spawn: IVec2,
+    /// Cells the drone factories stand in. All open, and none of them
+    /// [`spawn`](Self::spawn).
+    ///
+    /// May be shorter than [`MazeParams::factories`] asked for; see
+    /// [`pick_factories`].
+    pub factories: Vec<IVec2>,
     /// Seed this maze came from.
     ///
     /// Logged when a level starts, so that a maze someone got stuck in can be
@@ -133,10 +152,12 @@ pub fn generate(params: MazeParams, seed: u64) -> Maze {
     carve(&mut grid, &mut rng);
     thin(&mut grid, params.density, &mut rng);
     let spawn = pick_spawn(&grid, &mut rng);
+    let factories = pick_factories(&grid, spawn, params.factories, &mut rng);
 
     Maze {
         grid,
         spawn,
+        factories,
         seed,
         params,
     }
@@ -235,8 +256,8 @@ fn thin(grid: &mut Grid, density: f32, rng: &mut impl Rng) {
 
 /// Picks the cell the player starts in.
 ///
-/// Any open cell will do for now; M2 places the factories relative to it, at
-/// which point the choice starts to matter.
+/// Any open cell will do; the factories are then placed at a distance from
+/// whichever one it turned out to be.
 ///
 /// # Panics
 ///
@@ -245,6 +266,84 @@ fn pick_spawn(grid: &Grid, rng: &mut impl Rng) -> IVec2 {
     let open: Vec<IVec2> = grid.open().collect();
     assert!(!open.is_empty(), "a carved maze always has open cells");
     open[rng.random_range(0..open.len())]
+}
+
+/// How far, in cells, a factory must be from where the player starts.
+///
+/// Far enough that the level does not open with a factory in the windscreen, and
+/// that finding the first one is navigation rather than luck.
+const SPAWN_CLEARANCE: f32 = 8.0;
+
+/// How far, in cells, two factories must be from each other.
+///
+/// Wide enough that clearing one is a separate trip from clearing the next, and —
+/// once drones exist in M3 — that two of them cannot pool their output onto the
+/// same corridor.
+const FACTORY_SPACING: f32 = 6.0;
+
+/// Picks the cells the factories stand in.
+///
+/// Three things have to hold, and the last is the interesting one:
+///
+/// - clear of the player's spawn by [`SPAWN_CLEARANCE`],
+/// - clear of each other by [`FACTORY_SPACING`],
+/// - and **not load-bearing**. A factory is a building wide enough to plug a
+///   one-cell corridor, so a factory on a cell the maze routes through would seal
+///   off everything behind it. Whether a cell is load-bearing is not something the
+///   distance rules can express, so it is checked directly: seal the candidate in a
+///   scratch copy of the grid and see whether what is left is still one piece.
+///   The copy carries the factories already chosen, because three cells that are
+///   each individually spare can still be a region's only three ways out.
+///
+/// The distances are wants rather than needs. If they cannot all be met the whole
+/// sweep is retried with them scaled down, so a maze too cramped for the spacing
+/// gets crowded factories rather than none — but the connectivity check is never
+/// relaxed, so a maze can still come back with fewer factories than were asked
+/// for. Callers have to cope with that; see [`Maze::factories`].
+fn pick_factories(grid: &Grid, spawn: IVec2, wanted: i32, rng: &mut impl Rng) -> Vec<IVec2> {
+    let wanted = wanted.max(0) as usize;
+    let mut chosen = Vec::with_capacity(wanted);
+    if wanted == 0 {
+        return chosen;
+    }
+
+    let mut candidates: Vec<IVec2> = grid.open().filter(|cell| *cell != spawn).collect();
+    candidates.shuffle(rng);
+    // Sealed carries the chosen cells, so the connectivity check always sees the
+    // maze as it will actually be played rather than as it was generated.
+    let mut sealed = grid.clone();
+
+    let mut relax = 1.0;
+    while chosen.len() < wanted && relax > 0.1 {
+        let clearance = SPAWN_CLEARANCE * relax;
+        let spacing = FACTORY_SPACING * relax;
+        for &cell in &candidates {
+            if chosen.len() == wanted {
+                break;
+            }
+            // A chosen cell reads as wall in `sealed`, which is also how an
+            // earlier pass's picks are skipped on a later one.
+            if sealed.is_wall(cell)
+                || distance(cell, spawn) < clearance
+                || chosen.iter().any(|other| distance(cell, *other) < spacing)
+            {
+                continue;
+            }
+            sealed.set(cell, Cell::Wall);
+            if sealed.is_connected() {
+                chosen.push(cell);
+            } else {
+                sealed.set(cell, Cell::Open);
+            }
+        }
+        relax *= 0.6;
+    }
+    chosen
+}
+
+/// Straight-line distance between two cells, in cells.
+fn distance(a: IVec2, b: IVec2) -> f32 {
+    (a - b).as_vec2().length()
 }
 
 #[cfg(test)]
@@ -264,6 +363,20 @@ mod tests {
                 cols,
                 rows,
                 density,
+                ..MazeParams::LEVEL_ONE
+            },
+            seed,
+        )
+    }
+
+    /// A maze of the given size with a given number of factories in it.
+    fn with_factories(cols: i32, rows: i32, factories: i32, seed: u64) -> Maze {
+        generate(
+            MazeParams {
+                cols,
+                rows,
+                factories,
+                ..MazeParams::LEVEL_ONE
             },
             seed,
         )
@@ -407,6 +520,7 @@ mod tests {
             let second = generate(params, seed);
             assert_eq!(first.grid, second.grid, "seed {seed} grid");
             assert_eq!(first.spawn, second.spawn, "seed {seed} spawn");
+            assert_eq!(first.factories, second.factories, "seed {seed} factories");
         }
     }
 
@@ -439,5 +553,144 @@ mod tests {
         let m = maze(MIN_SPAN, MIN_SPAN, 1.0, 3);
         assert_eq!(m.grid.open_count(), 1);
         assert_eq!(m.spawn, IVec2::new(1, 1));
+    }
+
+    #[test]
+    fn a_level_one_maze_gets_every_factory_it_asked_for() {
+        for seed in 0..SEEDS {
+            let m = generate(MazeParams::LEVEL_ONE, seed);
+            assert_eq!(
+                m.factories.len(),
+                MazeParams::LEVEL_ONE.factories as usize,
+                "seed {seed} only placed {:?}",
+                m.factories
+            );
+        }
+    }
+
+    #[test]
+    fn factories_stand_on_open_cells_and_never_on_the_spawn() {
+        for seed in 0..SEEDS {
+            for (cols, rows) in SIZES {
+                let m = with_factories(cols, rows, 4, seed);
+                for &factory in &m.factories {
+                    assert!(
+                        m.grid.is_open(factory),
+                        "{cols}×{rows} seed {seed}: factory in a wall at {factory:?}"
+                    );
+                    assert_ne!(
+                        factory, m.spawn,
+                        "{cols}×{rows} seed {seed}: factory on the spawn cell"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn no_two_factories_are_placed_on_the_same_cell() {
+        for seed in 0..SEEDS {
+            let m = generate(MazeParams::LEVEL_ONE, seed);
+            for (index, &factory) in m.factories.iter().enumerate() {
+                assert!(
+                    !m.factories[index + 1..].contains(&factory),
+                    "seed {seed}: {factory:?} placed twice"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn factories_keep_their_distance_from_the_spawn_and_from_each_other() {
+        // At level-one size there is room for the full clearances, so nothing
+        // should have had to fall back on a relaxed sweep.
+        for seed in 0..SEEDS {
+            let m = generate(MazeParams::LEVEL_ONE, seed);
+            for (index, &factory) in m.factories.iter().enumerate() {
+                let from_spawn = distance(factory, m.spawn);
+                assert!(
+                    from_spawn >= SPAWN_CLEARANCE,
+                    "seed {seed}: {factory:?} is only {from_spawn} cells from the spawn"
+                );
+                for &other in &m.factories[index + 1..] {
+                    let apart = distance(factory, other);
+                    assert!(
+                        apart >= FACTORY_SPACING,
+                        "seed {seed}: {factory:?} and {other:?} are only {apart} cells apart"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn no_factory_walls_off_part_of_the_maze() {
+        // The invariant that makes a level winnable: a factory is wide enough to
+        // plug a corridor, so with every one of them treated as solid the player
+        // must still be able to reach all of them.
+        for seed in 0..SEEDS {
+            for (cols, rows) in SIZES {
+                for factories in [1, 4, 8] {
+                    let m = with_factories(cols, rows, factories, seed);
+                    let mut sealed = m.grid.clone();
+                    for &factory in &m.factories {
+                        sealed.set(factory, Cell::Wall);
+                    }
+                    assert!(
+                        sealed.is_connected(),
+                        "{cols}×{rows} seed {seed} with {:?} cut the maze into pieces",
+                        m.factories
+                    );
+                    // And reachable specifically from where the player starts.
+                    assert_eq!(
+                        sealed.reachable_from(m.spawn),
+                        sealed.open_count(),
+                        "{cols}×{rows} seed {seed}: not everything is reachable from the spawn"
+                    );
+                    // And winnable, checked by playing it out. A factory next to
+                    // an open cell can be shot at, and killing it opens that cell
+                    // up in turn — which is how a factory hemmed in by nothing but
+                    // other factories, as happens in a maze small enough for the
+                    // spacing to collapse, is still reachable in the end.
+                    let mut standing = m.factories.clone();
+                    while let Some(index) = standing
+                        .iter()
+                        .position(|cell| sealed.has_open_neighbour(*cell))
+                    {
+                        sealed.set(standing.swap_remove(index), Cell::Open);
+                    }
+                    assert!(
+                        standing.is_empty(),
+                        "{cols}×{rows} seed {seed}: {standing:?} can never be got at"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn asking_for_no_factories_places_none() {
+        let m = with_factories(33, 25, 0, 5);
+        assert!(m.factories.is_empty());
+        // And a negative request is the same as none rather than a panic.
+        assert!(with_factories(33, 25, -3, 5).factories.is_empty());
+        assert_eq!(with_factories(33, 25, -3, 5).params.factories, 0);
+    }
+
+    #[test]
+    fn a_maze_with_nowhere_to_put_a_factory_comes_back_with_fewer() {
+        // One open cell, and the player is standing in it. There is no honest
+        // answer other than an empty list, and the caller has to survive it.
+        let m = with_factories(MIN_SPAN, MIN_SPAN, 4, 11);
+        assert_eq!(m.grid.open_count(), 1);
+        assert!(m.factories.is_empty());
+    }
+
+    #[test]
+    fn a_cramped_maze_crowds_its_factories_rather_than_dropping_them() {
+        // 11×11 has nothing like eight cells that are all 8 apart from the spawn
+        // and 6 from each other, so the spacing has to give way.
+        let m = with_factories(11, 11, 8, 77);
+        assert_eq!(m.factories.len(), 8, "got {:?}", m.factories);
     }
 }

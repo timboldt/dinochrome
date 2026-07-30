@@ -4,15 +4,17 @@ use bevy::prelude::*;
 
 /// The screens the app can be in.
 ///
-/// `LevelComplete` and `GameOver` from the design sketch are deliberately absent
-/// until the milestones that can actually reach them (M2 and M3); an unreachable
-/// state is just a lie in the type system.
+/// `GameOver` from the design sketch is deliberately absent until M3, which is the
+/// first milestone in which anything can shoot back; an unreachable state is just a
+/// lie in the type system.
 #[derive(States, Debug, Clone, Copy, Default, Eq, PartialEq, Hash)]
 pub enum AppState {
     #[default]
     MainMenu,
     Playing,
     Paused,
+    /// Every factory in the level is destroyed.
+    LevelComplete,
 }
 
 /// Leaves the menu once the player asks to start.
@@ -38,13 +40,27 @@ pub fn toggle_pause(
     match state.get() {
         AppState::Playing => next.set(AppState::Paused),
         AppState::Paused => next.set(AppState::Playing),
-        AppState::MainMenu => {}
+        AppState::MainMenu | AppState::LevelComplete => {}
     }
 }
 
 /// Abandons the current run and returns to the menu.
 pub fn quit_to_menu(keys: Res<ButtonInput<KeyCode>>, mut next: ResMut<NextState<AppState>>) {
     if keys.just_pressed(KeyCode::KeyQ) {
+        next.set(AppState::MainMenu);
+    }
+}
+
+/// Leaves the level-cleared screen.
+///
+/// Back to the menu for now. M4 turns this into progression — the next level, one
+/// harder — which is why it is a transition of its own rather than a second use of
+/// [`quit_to_menu`].
+pub fn leave_level_complete(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut next: ResMut<NextState<AppState>>,
+) {
+    if keys.just_pressed(KeyCode::Enter) || keys.just_pressed(KeyCode::Space) {
         next.set(AppState::MainMenu);
     }
 }

@@ -1,5 +1,13 @@
 //! Moving a circle through the maze grid.
 //!
+//! There are two ways to move, and the game needs both. A tank *slides*: it is
+//! resolved one axis at a time and keeps whatever part of its move a wall did not
+//! refuse. A shell *sweeps*: it goes in a straight line until something stops it,
+//! at which point it is done travelling forever. [`slide`] and [`sweep`] are those
+//! two.
+//!
+//! # Sliding
+//!
 //! Entities are circles; walls are the axis-aligned squares of the grid. A move
 //! is resolved one axis at a time — X first with the old Y, then Y with the new
 //! X — which is what gives wall sliding for free: a diagonal push into a wall
@@ -13,12 +21,16 @@
 //! of travel by exactly as much as the Pythagorean slack allows. That is what
 //! lets a tank round the corner of a corridor mouth instead of catching on it.
 //!
+//! Buildings are not in the grid — a factory stands in an open cell — so
+//! [`slide_around`] takes them as a slice of [`Blocker`]s and resolves them as
+//! circles.
+//!
 //! # Tunnelling
 //!
-//! Long moves are split into substeps short enough that the swept region always
-//! overlaps every wall in between. Callers therefore do not have to clamp
-//! velocities: shells in M2 can be as fast as they like without passing through
-//! walls. See [`MAX_SUBSTEP`].
+//! Long slides are split into substeps short enough that the swept region always
+//! overlaps every wall in between, so callers do not have to clamp velocities.
+//! See [`MAX_SUBSTEP`]. Sweeps do not substep at all: they solve for the impact
+//! point directly, so a shell is exact at any speed.
 
 use glam::{BVec2, IVec2, Vec2};
 
@@ -43,12 +55,26 @@ pub const MAX_SUBSTEP: f32 = CELL_SIZE * 0.5;
 /// at these magnitudes, and four thousand times thinner than a wall.
 pub const SKIN: f32 = 1.0 / 64.0;
 
+/// A round obstacle that is not part of the grid.
+///
+/// Drone factories are buildings standing in open cells: the maze does not know
+/// they are there, so whatever has to drive around one is handed them as these.
+/// A blocker is immovable — a slide is pushed out of it, never the other way
+/// round.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Blocker {
+    /// World-space centre.
+    pub center: Vec2,
+    /// Radius, in world units.
+    pub radius: f32,
+}
+
 /// Where a move ended up, and which axes were stopped short.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Slide {
     /// The resolved position.
     pub position: Vec2,
-    /// Per-axis: true if a wall clamped this axis at any point during the move.
+    /// Per-axis: true if something clamped this axis at any point during the move.
     ///
     /// Callers use this to zero the corresponding velocity component. Without
     /// that, a tank held against a wall keeps accumulating speed into it and
@@ -61,6 +87,17 @@ pub struct Slide {
 /// `position` is assumed not to already overlap a wall. Anything outside the
 /// grid counts as solid, so the maze is bounded without a separate check.
 pub fn slide(grid: &Grid, position: Vec2, radius: f32, delta: Vec2) -> Slide {
+    slide_around(grid, position, radius, delta, &[])
+}
+
+/// [`slide`], but also refusing to pass through a set of round obstacles.
+pub fn slide_around(
+    grid: &Grid,
+    position: Vec2,
+    radius: f32,
+    delta: Vec2,
+    blockers: &[Blocker],
+) -> Slide {
     let distance = delta.length();
     let mut result = Slide {
         position,
@@ -70,20 +107,201 @@ pub fn slide(grid: &Grid, position: Vec2, radius: f32, delta: Vec2) -> Slide {
         return result;
     }
 
-    // `ceil` of a positive quotient is at least 1, so there is always a step.
+    // `ceil` of a positive quotient is at least 1, so there is always a step. A
+    // substep is shorter than a blocker's radius as well as than a wall's
+    // thickness, so nothing steps clean over a building either.
     let steps = (distance / MAX_SUBSTEP).ceil() as u32;
     let step = delta / steps as f32;
 
     for _ in 0..steps {
-        let x = resolve(grid, result.position, radius, step.x, Axis::X);
-        result.blocked.x |= x != result.position.x + step.x;
-        result.position.x = x;
+        let from = result.position;
+        let mut to = from;
+        to.x = resolve(grid, to, radius, step.x, Axis::X);
+        to.y = resolve(grid, to, radius, step.y, Axis::Y);
 
-        let y = resolve(grid, result.position, radius, step.y, Axis::Y);
-        result.blocked.y |= y != result.position.y + step.y;
-        result.position.y = y;
+        // A blocker is round, so the way out of one is along the line from its
+        // centre. That keeps whatever part of the move was tangential to it,
+        // which is what lets a tank scrape around a factory instead of stopping
+        // dead on its side. The push can only ever be *away* from the blocker, so
+        // the one thing it can go wrong against is a wall on the far side — and
+        // an entity wedged between the two has nowhere to be, so the substep is
+        // refused outright and nothing further is attempted along this heading.
+        let pushed = push_out(to, radius, blockers);
+        if pushed != to && !is_clear(grid, pushed, radius) {
+            result.blocked = BVec2::TRUE;
+            break;
+        }
+        result.position = pushed;
+
+        // Where the substep was aiming, had nothing been in the way. `SKIN`
+        // rather than an exact comparison because parking flush against a face
+        // is only exact to within `f32` noise at maze-sized coordinates.
+        let aimed = from + step;
+        result.blocked.x |= (result.position.x - aimed.x).abs() > SKIN;
+        result.blocked.y |= (result.position.y - aimed.y).abs() > SKIN;
     }
     result
+}
+
+/// Where a straight, non-sliding move ended, and what stopped it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Sweep {
+    /// Fraction of the requested `delta` actually travelled, in `0.0..=1.0`.
+    pub travel: f32,
+    /// The position reached.
+    pub position: Vec2,
+    /// The wall cell struck, or `None` if the move ran its full length.
+    pub hit: Option<IVec2>,
+}
+
+/// Moves a circle of `radius` from `from` by `delta` until a wall stops it.
+///
+/// This is what a shell does: no sliding, and no substepping either — the impact
+/// point is solved for rather than crept up on, so it is exact however fast the
+/// thing is going and there is nothing for it to tunnel through. `travel` is
+/// reported alongside the position so a caller can compare a wall hit against
+/// whatever else it is testing (see [`hit_circle`]) and take the nearer one.
+pub fn sweep(grid: &Grid, from: Vec2, radius: f32, delta: Vec2) -> Sweep {
+    let mut travel = 1.0;
+    let mut hit = None;
+
+    if delta != Vec2::ZERO {
+        // Every cell the swept circle could touch, from either endpoint outwards.
+        let to = from + delta;
+        let low = grid.cell_at(from.min(to) - Vec2::splat(radius));
+        let high = grid.cell_at(from.max(to) + Vec2::splat(radius));
+        for y in low.y..=high.y {
+            for x in low.x..=high.x {
+                let cell = IVec2::new(x, y);
+                if !grid.is_wall(cell) {
+                    continue;
+                }
+                let (min, max) = (grid.cell_min(cell), grid.cell_max(cell));
+                if let Some(t) = hit_cell(from, delta, radius, min, max)
+                    && t < travel
+                {
+                    travel = t;
+                    hit = Some(cell);
+                }
+            }
+        }
+    }
+
+    Sweep {
+        travel,
+        position: from + delta * travel,
+        hit,
+    }
+}
+
+/// Earliest fraction of `delta` at which a circle of `radius` starting at `from`
+/// touches a stationary circle of `target_radius` at `target`.
+///
+/// `None` if it never does within the move. `Some(0.0)` if the two already
+/// overlap, which is a real answer rather than a degenerate one: a shell spawned
+/// inside its target has hit it.
+pub fn hit_circle(
+    from: Vec2,
+    delta: Vec2,
+    radius: f32,
+    target: Vec2,
+    target_radius: f32,
+) -> Option<f32> {
+    // Solving |offset + delta·t| == clearance for the smaller root of the
+    // quadratic in t — the larger one is where it would come back out the far
+    // side.
+    let clearance = radius + target_radius;
+    let offset = from - target;
+    let c = offset.length_squared() - clearance * clearance;
+    if c <= 0.0 {
+        return Some(0.0);
+    }
+    let a = delta.length_squared();
+    if a == 0.0 {
+        return None;
+    }
+    let b = 2.0 * offset.dot(delta);
+    let discriminant = b * b - 4.0 * a * c;
+    if discriminant < 0.0 {
+        return None;
+    }
+    let t = (-b - discriminant.sqrt()) / (2.0 * a);
+    (0.0..=1.0).contains(&t).then_some(t)
+}
+
+/// Earliest fraction of `delta` at which a circle of `radius` starting at `from`
+/// touches the box `min..=max`.
+///
+/// The circle is shrunk to a point and the box grown to compensate — their
+/// Minkowski sum, which is the box inflated by `radius` with its corners rounded
+/// off to that radius — so this reduces to a ray test. A slab test finds where the
+/// ray enters the inflated *square*; if that happens level with one of the faces
+/// it is the answer, and if it happens off the end of both then the real contact
+/// is against a rounded corner, which is a ray/circle solve.
+fn hit_cell(from: Vec2, delta: Vec2, radius: f32, min: Vec2, max: Vec2) -> Option<f32> {
+    let grown_min = min - Vec2::splat(radius);
+    let grown_max = max + Vec2::splat(radius);
+
+    // Clamped to the move: `enter` starting at zero means "already inside" comes
+    // back as contact at once, and `exit` starting at one means a wall beyond the
+    // end of the move is not a wall this move hits.
+    let mut enter = 0.0f32;
+    let mut exit = 1.0f32;
+    for axis in 0..2 {
+        let speed = delta[axis];
+        let start = from[axis];
+        if speed == 0.0 {
+            // Never crosses this pair of slab faces: either it is between them
+            // for the whole move, or it never is at all.
+            if start < grown_min[axis] || start > grown_max[axis] {
+                return None;
+            }
+            continue;
+        }
+        let near = (grown_min[axis] - start) / speed;
+        let far = (grown_max[axis] - start) / speed;
+        enter = enter.max(near.min(far));
+        exit = exit.min(near.max(far));
+        if enter > exit {
+            return None;
+        }
+    }
+
+    let touch = from + delta * enter;
+    let past_x = touch.x < min.x || touch.x > max.x;
+    let past_y = touch.y < min.y || touch.y > max.y;
+    if !(past_x && past_y) {
+        return Some(enter);
+    }
+    // Off the end of a face on both axes, so the nearest part of the box is the
+    // corner `touch` clamps onto — and the inflated square's sharp corner is not
+    // where a circle actually makes contact with it.
+    hit_circle(from, delta, radius, touch.clamp(min, max), 0.0)
+}
+
+/// Moves a circle out of every blocker it overlaps, along the line of centres.
+///
+/// Blockers are placed far enough apart that a circle cannot be inside two at
+/// once (see `maze::generate`), so one pass settles it.
+fn push_out(position: Vec2, radius: f32, blockers: &[Blocker]) -> Vec2 {
+    let mut position = position;
+    for blocker in blockers {
+        let clearance = radius + blocker.radius;
+        let offset = position - blocker.center;
+        let distance = offset.length();
+        if distance >= clearance {
+            continue;
+        }
+        // Exactly on the centre leaves no line to push along, so any direction
+        // will do. It takes something spawning dead on top of a building.
+        let out = if distance > 0.0 {
+            offset / distance
+        } else {
+            Vec2::Y
+        };
+        position = blocker.center + out * clearance;
+    }
+    position
 }
 
 /// True if a circle of `radius` at `position` overlaps no wall.
@@ -419,10 +637,12 @@ mod tests {
 
     /// The tunnelling guard, over speeds from a crawling tank to absurd.
     ///
-    /// The tank's own worst case is trivial — `HullParams::TANK` at 180 px/s
-    /// covers 3 px in a 1/60 s tick — but shells in M2 are an order of magnitude
-    /// faster, and nothing about the design stops that number from growing. The
-    /// substep guard has to hold without callers clamping anything.
+    /// Nothing that slides is currently fast enough for this to be interesting —
+    /// `HullParams::TANK` at 180 px/s covers 3 px in a 1/60 s tick — but the drones
+    /// M3 brings are faster than the tank and nothing about the design stops that
+    /// number from growing. The substep guard has to hold without callers clamping
+    /// anything. (Shells are faster still, but they [`sweep`] rather than slide;
+    /// `no_sweep_speed_gets_through_a_wall` is their half of this.)
     #[test]
     fn no_speed_tunnels_through_a_wall() {
         let grid = room();
@@ -498,6 +718,356 @@ mod tests {
             assert!(
                 is_clear(&maze.grid, position, R),
                 "tick {tick} ended inside a wall at {position:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_sweep_with_nothing_in_the_way_runs_its_full_length() {
+        let grid = room();
+        let from = at(1, 1);
+        let delta = Vec2::new(C * 2.0, 0.0);
+        let result = sweep(&grid, from, 4.0, delta);
+        assert_eq!(result.travel, 1.0);
+        assert_eq!(result.hit, None);
+        assert!((result.position - (from + delta)).length() < 1e-3);
+    }
+
+    #[test]
+    fn a_zero_length_sweep_hits_nothing_even_from_against_a_wall() {
+        let grid = junction();
+        let from = Vec2::new(C + 4.0, at(1, 1).y);
+        let result = sweep(&grid, from, 4.0, Vec2::ZERO);
+        assert_eq!(result.travel, 1.0);
+        assert_eq!(result.position, from);
+        assert_eq!(result.hit, None);
+    }
+
+    #[test]
+    fn a_sweep_stops_flush_against_the_wall_face_it_hit() {
+        let grid = junction();
+        let radius = 4.0;
+        let from = at(1, 1);
+        // Far past the end of the corridor, which is walled at cell (4,1).
+        let result = sweep(&grid, from, radius, Vec2::new(C * 10.0, 0.0));
+        assert_eq!(result.hit, Some(IVec2::new(4, 1)));
+        assert!(
+            (result.position.x - (4.0 * C - radius)).abs() < 1e-3,
+            "got {}",
+            result.position.x
+        );
+        // Flush is contact, not overlap.
+        assert!(is_clear(&grid, result.position, radius));
+    }
+
+    #[test]
+    fn a_sweep_reports_the_first_wall_it_meets_and_not_a_later_one() {
+        // Two walls in a row along the sweep: the near one has to win.
+        let grid = Grid::from_rows(&[
+            "#####", //
+            "#..##", //
+            "#####", //
+        ]);
+        let result = sweep(&grid, at(1, 1), 4.0, Vec2::new(C * 4.0, 0.0));
+        assert_eq!(result.hit, Some(IVec2::new(3, 1)));
+    }
+
+    #[test]
+    fn a_sweep_grazing_a_convex_corner_stops_on_the_corner_and_not_the_face() {
+        // Along the row above the block in cell (2,2), passing 4 px over its
+        // top-left corner. A square-cornered test would have clamped this to the
+        // block's left face, a radius too early.
+        let grid = room();
+        let radius = 6.0;
+        let corner = Vec2::new(2.0 * C, 3.0 * C);
+        let from = Vec2::new(C * 1.5, corner.y + 4.0);
+        let result = sweep(&grid, from, radius, Vec2::new(C * 2.0, 0.0));
+        assert_eq!(result.hit, Some(IVec2::new(2, 2)));
+        // Contact is with the corner point, so the centre ends up exactly
+        // `radius` from it rather than `radius` short of the face.
+        let touch = result.position.distance(corner);
+        assert!((touch - radius).abs() < 1e-3, "corner distance {touch}");
+        assert!(
+            result.position.x > corner.x - radius + 1.0,
+            "a flat-face clamp would have stopped at x == {}: got {:?}",
+            corner.x - radius,
+            result.position
+        );
+    }
+
+    #[test]
+    fn a_sweep_that_only_just_misses_a_corner_carries_straight_on() {
+        let grid = room();
+        let radius = 6.0;
+        // A hair further over the same corner than the radius reaches.
+        let from = Vec2::new(C * 1.5, 3.0 * C + radius + 0.5);
+        let result = sweep(&grid, from, radius, Vec2::new(C * 2.0, 0.0));
+        assert_eq!(result.hit, None, "landed at {:?}", result.position);
+    }
+
+    #[test]
+    fn a_sweep_starting_inside_a_wall_goes_nowhere() {
+        let grid = room();
+        let inside = at(2, 2);
+        let result = sweep(&grid, inside, 4.0, Vec2::new(C, 0.0));
+        assert_eq!(result.travel, 0.0);
+        assert_eq!(result.position, inside);
+        assert_eq!(result.hit, Some(IVec2::new(2, 2)));
+    }
+
+    #[test]
+    fn no_sweep_speed_gets_through_a_wall() {
+        // The whole point of solving rather than stepping: a shell can be as fast
+        // as the design ever wants without a clamp anywhere.
+        let grid = room();
+        let radius = 4.0;
+        for speed in [640.0, 5_000.0, 100_000.0, 1.0e7] {
+            for direction in [
+                Vec2::X,
+                Vec2::NEG_X,
+                Vec2::Y,
+                Vec2::NEG_Y,
+                Vec2::new(1.0, 1.0).normalize(),
+                Vec2::new(-0.3, 1.0).normalize(),
+            ] {
+                for start in [at(1, 1), at(3, 1), at(1, 3), at(3, 3)] {
+                    let result = sweep(&grid, start, radius, direction * speed * crate::FIXED_DT);
+                    assert!(
+                        is_clear(&grid, result.position, radius),
+                        "{speed} px/s along {direction:?} from {start:?} ended inside a wall at \
+                         {:?}",
+                        result.position
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_sweep_across_a_whole_maze_always_ends_up_somewhere_legal() {
+        let maze = crate::maze::generate(crate::maze::MazeParams::LEVEL_ONE, 20260729);
+        let radius = 4.0;
+        let from = maze.grid.cell_center(maze.spawn);
+        for step in 0..360 {
+            let angle = step as f32 * std::f32::consts::TAU / 360.0;
+            let delta = Vec2::new(angle.cos(), angle.sin()) * 4000.0;
+            let result = sweep(&maze.grid, from, radius, delta);
+            assert!(
+                is_clear(&maze.grid, result.position, radius),
+                "bearing {step} ended inside a wall at {:?}",
+                result.position
+            );
+            assert!(
+                result.hit.is_some(),
+                "a maze is closed, so a 4000 px sweep has to hit something"
+            );
+        }
+    }
+
+    #[test]
+    fn hit_circle_finds_the_moment_of_contact_and_not_of_overlap() {
+        // Head-on: a radius-2 circle 12 away from a radius-2 target touches after
+        // 8 of the 10 units of travel.
+        let t = hit_circle(
+            Vec2::ZERO,
+            Vec2::new(10.0, 0.0),
+            2.0,
+            Vec2::new(12.0, 0.0),
+            2.0,
+        )
+        .expect("should connect");
+        assert!((t - 0.8).abs() < 1e-5, "got {t}");
+    }
+
+    #[test]
+    fn hit_circle_reports_an_existing_overlap_as_contact_at_once() {
+        let t = hit_circle(
+            Vec2::ZERO,
+            Vec2::new(10.0, 0.0),
+            4.0,
+            Vec2::new(3.0, 0.0),
+            4.0,
+        );
+        assert_eq!(t, Some(0.0));
+    }
+
+    #[test]
+    fn hit_circle_misses_what_it_stops_short_of_or_passes_beside() {
+        // Stops short: 20 away, only 10 units of travel.
+        assert_eq!(
+            hit_circle(
+                Vec2::ZERO,
+                Vec2::new(10.0, 0.0),
+                1.0,
+                Vec2::new(20.0, 0.0),
+                1.0
+            ),
+            None
+        );
+        // Passes beside: offset by more than the two radii together.
+        assert_eq!(
+            hit_circle(
+                Vec2::ZERO,
+                Vec2::new(40.0, 0.0),
+                1.0,
+                Vec2::new(20.0, 5.0),
+                1.0
+            ),
+            None
+        );
+        // Moving away from something it is already clear of.
+        assert_eq!(
+            hit_circle(
+                Vec2::ZERO,
+                Vec2::new(-40.0, 0.0),
+                1.0,
+                Vec2::new(20.0, 0.0),
+                1.0
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn hit_circle_on_a_stationary_circle_is_a_contact_test() {
+        let touching = hit_circle(Vec2::ZERO, Vec2::ZERO, 2.0, Vec2::new(3.0, 0.0), 2.0);
+        assert_eq!(touching, Some(0.0));
+        let apart = hit_circle(Vec2::ZERO, Vec2::ZERO, 2.0, Vec2::new(9.0, 0.0), 2.0);
+        assert_eq!(apart, None);
+    }
+
+    /// A factory-sized blocker in the middle of the open arena.
+    fn blocker(x: i32, y: i32) -> Blocker {
+        Blocker {
+            center: at(x, y),
+            radius: 22.0,
+        }
+    }
+
+    /// An open room with no interior walls, so only blockers are in the way.
+    fn open_room() -> Grid {
+        Grid::from_rows(&["......."; 7])
+    }
+
+    #[test]
+    fn a_slide_with_no_blockers_is_the_plain_slide() {
+        let grid = room();
+        let start = at(1, 1);
+        let delta = Vec2::new(C * 0.7, -C * 0.7);
+        assert_eq!(
+            slide_around(&grid, start, R, delta, &[]),
+            slide(&grid, start, R, delta)
+        );
+    }
+
+    #[test]
+    fn a_blocker_stops_a_tank_driving_straight_into_it() {
+        let grid = open_room();
+        let obstacle = blocker(3, 3);
+        let start = at(1, 3);
+        let mut position = start;
+        for _ in 0..200 {
+            position = slide_around(&grid, position, R, Vec2::new(3.0, 0.0), &[obstacle]).position;
+        }
+        let gap = position.distance(obstacle.center);
+        assert!(
+            (gap - (R + obstacle.radius)).abs() < 1e-2,
+            "should be resting against the building, got a gap of {gap}"
+        );
+    }
+
+    #[test]
+    fn driving_into_a_blocker_reports_the_axis_as_blocked() {
+        let grid = open_room();
+        let obstacle = blocker(3, 3);
+        // Already flush against its left side.
+        let start = obstacle.center - Vec2::new(R + obstacle.radius, 0.0);
+        let result = slide_around(&grid, start, R, Vec2::new(3.0, 0.0), &[obstacle]);
+        assert!(result.blocked.x, "a banked velocity would launch the tank");
+        assert!(!result.blocked.y);
+    }
+
+    #[test]
+    fn a_tank_scrapes_around_a_blocker_instead_of_stopping_on_it() {
+        let grid = open_room();
+        let obstacle = blocker(3, 3);
+        // Coming in slightly off centre, which is what makes it a graze.
+        let start = at(1, 3) + Vec2::new(0.0, 6.0);
+        let mut position = start;
+        for _ in 0..400 {
+            position = slide_around(&grid, position, R, Vec2::new(3.0, 0.0), &[obstacle]).position;
+            assert!(
+                position.distance(obstacle.center) > R + obstacle.radius - SKIN,
+                "ended up inside the building at {position:?}"
+            );
+        }
+        assert!(
+            position.x > obstacle.center.x + obstacle.radius,
+            "should have got past it rather than parking on it: {position:?}"
+        );
+    }
+
+    #[test]
+    fn nothing_tunnels_through_a_blocker_however_fast_it_is_going() {
+        let grid = open_room();
+        let obstacle = blocker(3, 3);
+        let start = at(1, 3);
+        for speed in [180.0, 1_000.0, 20_000.0, 1.0e6] {
+            let delta = Vec2::new(speed * crate::FIXED_DT, 0.0);
+            let result = slide_around(&grid, start, R, delta, &[obstacle]);
+            assert!(
+                result.position.x <= obstacle.center.x,
+                "{speed} px/s stepped clean over the building to {:?}",
+                result.position
+            );
+        }
+    }
+
+    #[test]
+    fn a_tank_wedged_between_a_blocker_and_a_wall_stops_rather_than_clipping() {
+        // A one-cell corridor with a building in it: the gap either side is 10 px
+        // and the tank needs 20, so there is no way past and no way through.
+        let grid = Grid::from_rows(&[
+            "#####", //
+            "#...#", //
+            "#####", //
+        ]);
+        let obstacle = blocker(3, 1);
+        let start = at(1, 1);
+        let mut position = start;
+        for _ in 0..300 {
+            position = slide_around(&grid, position, R, Vec2::new(3.0, 0.0), &[obstacle]).position;
+            assert!(
+                is_clear(&grid, position, R),
+                "squeezed into the wall at {position:?}"
+            );
+            assert!(
+                position.distance(obstacle.center) > R + obstacle.radius - SKIN,
+                "squeezed into the building at {position:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_blocker_never_pushes_anything_out_of_the_maze() {
+        // Flush against the bottom wall with a building directly above: the push
+        // out of the building must not become a push through the floor.
+        let grid = Grid::from_rows(&[
+            "#####", //
+            "#...#", //
+            "#...#", //
+            "#####", //
+        ]);
+        let obstacle = Blocker {
+            center: at(2, 2) - Vec2::new(0.0, 8.0),
+            radius: 22.0,
+        };
+        let mut position = Vec2::new(at(2, 1).x, C + R);
+        for _ in 0..200 {
+            position = slide_around(&grid, position, R, Vec2::new(0.0, 3.0), &[obstacle]).position;
+            assert!(
+                is_clear(&grid, position, R),
+                "pushed through the floor to {position:?}"
             );
         }
     }
