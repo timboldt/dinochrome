@@ -7,9 +7,12 @@
 //! what the frame rate is. No simulation system reads `Time::delta`.
 
 use bevy::prelude::*;
-use dinochrome_core::{FIXED_DT, collision, hull};
+use dinochrome_core::{FIXED_DT, collision, hull, turret, weapon};
 
+use crate::factory::{self, Factory};
 use crate::maze::Maze;
+use crate::turret::{AimCommand, Traverse, Turret};
+use crate::weapon::{FireCommand, Weapon};
 
 /// Marks the player-controlled tank.
 #[derive(Component, Debug, Default)]
@@ -52,6 +55,13 @@ pub fn spawn_tank(mut commands: Commands, maze: Res<Maze>) {
         DriveCommand::default(),
         Hull(hull::HullParams::TANK),
         GridCollider(TANK_RADIUS),
+        // The turret starts pointing where the hull does, which is +X because
+        // nothing has told it otherwise yet.
+        Turret::default(),
+        Traverse(turret::TurretParams::TANK),
+        AimCommand::default(),
+        Weapon(weapon::Weapon::new(weapon::WeaponParams::TANK)),
+        FireCommand::default(),
         Transform::from_xyz(at.x, at.y, 0.0),
     ));
 }
@@ -65,7 +75,7 @@ pub fn despawn_tank(mut commands: Commands, tanks: Query<Entity, With<Tank>>) {
 
 /// Samples the keyboard into each tank's drive command.
 ///
-/// WASD drives the hull. Arrow keys are left free for the turret in M2.
+/// WASD drives the hull; the arrow keys aim the turret, in `crate::turret`.
 pub fn sample_drive_input(
     keys: Res<ButtonInput<KeyCode>>,
     mut tanks: Query<&mut DriveCommand, With<Tank>>,
@@ -101,21 +111,36 @@ pub fn clear_drive_input(mut tanks: Query<&mut DriveCommand>) {
 }
 
 /// Advances every tank by one simulation tick.
+///
+/// Factories are buildings the maze grid knows nothing about, so they come in
+/// separately — the `Without<Factory>` is what proves to Bevy that this
+/// `&mut Transform` and the factories' `&Transform` can never be the same entity.
 pub fn move_tanks(
     maze: Res<Maze>,
-    mut tanks: Query<(
-        &mut Transform,
-        &mut Velocity,
-        &DriveCommand,
-        &Hull,
-        &GridCollider,
-    )>,
+    factories: Query<(&Transform, &GridCollider), With<Factory>>,
+    mut tanks: Query<
+        (
+            &mut Transform,
+            &mut Velocity,
+            &DriveCommand,
+            &Hull,
+            &GridCollider,
+        ),
+        Without<Factory>,
+    >,
 ) {
+    let blockers = factory::blockers(&factories);
     for (mut transform, mut velocity, command, params, collider) in &mut tanks {
         velocity.0 = hull::step_velocity(velocity.0, command.0, params.0, FIXED_DT);
 
         let from = transform.translation.truncate();
-        let moved = collision::slide(&maze.grid, from, collider.0, velocity.0 * FIXED_DT);
+        let moved = collision::slide_around(
+            &maze.grid,
+            from,
+            collider.0,
+            velocity.0 * FIXED_DT,
+            &blockers,
+        );
         transform.translation.x = moved.position.x;
         transform.translation.y = moved.position.y;
 
@@ -131,17 +156,20 @@ pub fn move_tanks(
     }
 }
 
-/// Gives every tank its placeholder sprite.
+/// Gives every tank its placeholder sprite, and the barrel that hangs off it.
 ///
 /// This lives in the presentation layer rather than in [`spawn_tank`] so the
 /// simulation can be stepped headlessly, with no renderer and no image assets.
+/// Both sprites are attached together because both are keyed off the hull not
+/// having one yet — split in two, whichever ran second would run every frame.
 pub fn attach_tank_sprite(
     mut commands: Commands,
     tanks: Query<Entity, (With<Tank>, Without<Sprite>)>,
 ) {
     for entity in &tanks {
-        commands
-            .entity(entity)
-            .insert(Sprite::from_color(crate::palette::TANK, TANK_SIZE));
+        commands.entity(entity).insert((
+            Sprite::from_color(crate::palette::TANK, TANK_SIZE),
+            children![crate::turret::barrel()],
+        ));
     }
 }

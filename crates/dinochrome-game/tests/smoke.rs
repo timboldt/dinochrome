@@ -11,31 +11,54 @@
 //! because in a real maze "drive right for a second" means "drive right until a
 //! wall", and where that wall is depends on the seed.
 
+use std::f32::consts::{FRAC_PI_2, PI};
+
 use bevy::input::keyboard::{Key, KeyboardInput, NativeKey};
 use bevy::input::{ButtonState, InputPlugin};
 use bevy::prelude::*;
 use bevy::state::app::StatesPlugin;
 use bevy::time::TimeUpdateStrategy;
 use dinochrome_core::maze::MazeParams;
+use dinochrome_core::weapon::WeaponParams;
 use dinochrome_core::{CELL_SIZE, collision};
+use dinochrome_game::factory::{FACTORY_RADIUS, Factory};
 use dinochrome_game::maze::{Maze, MazeConfig};
 use dinochrome_game::player::{DriveCommand, Tank, Velocity};
+use dinochrome_game::turret::Turret;
+use dinochrome_game::weapon::{Health, SHELL_RADIUS, Shell};
 use dinochrome_game::{AppState, SimPlugin};
 
 /// The tank's collider radius, as `player` sets it.
 const TANK_RADIUS: f32 = 20.0;
 
-/// A maze whose whole interior is open: a room with a wall around it.
+/// The gun the tank is given, so tests can talk in its numbers rather than in
+/// copies of them.
+const GUN: WeaponParams = WeaponParams::TANK;
+
+/// A maze whose whole interior is open, with nothing standing in it.
 ///
 /// Movement tests need somewhere to drive without the seed deciding how far they
-/// get.
+/// get — and without a building deciding it either, which is why there are no
+/// factories in here.
 fn arena() -> MazeConfig {
     MazeConfig {
         params: MazeParams {
             density: 0.0,
+            factories: 0,
             ..MazeParams::LEVEL_ONE
         },
         seed: Some(1),
+    }
+}
+
+/// The same open arena, with `factories` buildings placed in it.
+fn arena_with_factories(factories: i32) -> MazeConfig {
+    MazeConfig {
+        params: MazeParams {
+            factories,
+            ..arena().params
+        },
+        ..arena()
     }
 }
 
@@ -168,6 +191,89 @@ fn maze_center(app: &App) -> Vec2 {
 /// The border ring is one cell thick, so the last open cell ends one cell in.
 fn arena_far_corner(app: &App) -> Vec2 {
     maze_size(app) - Vec2::splat(CELL_SIZE + TANK_RADIUS)
+}
+
+/// Which way the turret is pointing, in radians.
+fn turret_angle(app: &mut App) -> f32 {
+    let mut query = app.world_mut().query_filtered::<&Turret, With<Tank>>();
+    query.single(app.world()).expect("tank should exist").0
+}
+
+/// Points the turret, so a shooting test does not have to wait out the traverse
+/// or work out which arrow keys add up to a bearing.
+fn aim_turret(app: &mut App, angle: f32) {
+    let mut query = app.world_mut().query_filtered::<&mut Turret, With<Tank>>();
+    let mut turret = query
+        .single_mut(app.world_mut())
+        .expect("exactly one tank should exist");
+    turret.0 = angle;
+}
+
+fn count<T: Component>(app: &mut App) -> usize {
+    app.world_mut()
+        .query_filtered::<Entity, With<T>>()
+        .iter(app.world())
+        .count()
+}
+
+/// Where every factory still standing is, in a stable order.
+///
+/// Sorted because query iteration order is not part of Bevy's API, and a test that
+/// says "the first factory" has to mean the same one every run.
+fn factory_centers(app: &mut App) -> Vec<Vec2> {
+    let mut query = app
+        .world_mut()
+        .query_filtered::<&Transform, With<Factory>>();
+    let mut centers: Vec<Vec2> = query
+        .iter(app.world())
+        .map(|transform| transform.translation.truncate())
+        .collect();
+    centers.sort_by(|a, b| a.x.total_cmp(&b.x).then(a.y.total_cmp(&b.y)));
+    centers
+}
+
+/// Hit points left across every standing factory.
+fn factory_health(app: &mut App) -> i32 {
+    let mut query = app.world_mut().query_filtered::<&Health, With<Factory>>();
+    query.iter(app.world()).map(|health| health.current()).sum()
+}
+
+/// Where every shell in flight is.
+fn shell_positions(app: &mut App) -> Vec<Vec2> {
+    let mut query = app.world_mut().query_filtered::<&Transform, With<Shell>>();
+    query
+        .iter(app.world())
+        .map(|transform| transform.translation.truncate())
+        .collect()
+}
+
+/// Parks the tank a clear 60 px off `target` and points the gun at it.
+///
+/// The stand-off is toward the middle of the arena, which in an open room is the
+/// one direction guaranteed to have space in it. 60 px clears the tank's radius
+/// plus the building's, and leaves the muzzle just outside the building rather than
+/// inside it, so a shell has somewhere to start.
+fn take_aim_at(app: &mut App, target: Vec2) {
+    let inward = maze_center(app) - target;
+    let inward = if inward == Vec2::ZERO {
+        Vec2::X
+    } else {
+        inward.normalize()
+    };
+    place_tank(app, target + inward * 60.0);
+    aim_turret(app, (-inward).to_angle());
+}
+
+/// Shells `target` until whatever is standing there is rubble.
+///
+/// Five shells at the gun's cooldown is a hundred and nine ticks; the margin is
+/// for the last one's flight time.
+fn shell_to_pieces(app: &mut App, target: Vec2) {
+    take_aim_at(app, target);
+    press(app, KeyCode::Space);
+    step(app, 160);
+    release(app, KeyCode::Space);
+    step(app, 2);
 }
 
 #[test]
@@ -395,6 +501,334 @@ fn a_long_run_through_a_real_maze_never_ends_up_inside_a_wall() {
         assert!(
             collision::is_clear(&grid, at, TANK_RADIUS),
             "tick {tick}: the tank ended up inside a wall at {at:?}"
+        );
+    }
+}
+
+#[test]
+fn the_arrow_keys_aim_the_turret_without_steering_the_tank() {
+    let mut app = headless_app(arena());
+    start_playing(&mut app);
+    let center = maze_center(&app);
+    place_tank(&mut app, center);
+    aim_turret(&mut app, 0.0);
+    let parked = tank_position(&mut app);
+
+    // A quarter turn is half a second of traverse; a full second is plenty.
+    press(&mut app, KeyCode::ArrowUp);
+    step(&mut app, 60);
+
+    let angle = turret_angle(&mut app);
+    assert!(
+        (angle - FRAC_PI_2).abs() < 1e-4,
+        "expected the turret straight up, got {angle}"
+    );
+    assert_eq!(
+        tank_position(&mut app),
+        parked,
+        "aiming the turret is not driving the hull"
+    );
+}
+
+#[test]
+fn the_turret_slews_at_its_own_rate_rather_than_snapping_round() {
+    let mut app = headless_app(arena());
+    start_playing(&mut app);
+    aim_turret(&mut app, 0.0);
+
+    // Half a turn away: the furthest it can be asked to go.
+    press(&mut app, KeyCode::ArrowLeft);
+    step(&mut app, 1);
+    let after_one_tick = turret_angle(&mut app);
+    assert!(
+        after_one_tick.abs() > 0.0,
+        "the turret should have started turning"
+    );
+    assert!(
+        after_one_tick.abs() < 0.1,
+        "and should not have arrived inside one tick: {after_one_tick}"
+    );
+
+    // Half a turn at PI rad/s is a second.
+    step(&mut app, 60);
+    let arrived = turret_angle(&mut app);
+    assert!(
+        (arrived.abs() - PI).abs() < 1e-3,
+        "expected the turret pointing left, got {arrived}"
+    );
+}
+
+#[test]
+fn the_turret_holds_its_bearing_when_nothing_is_asked_of_it() {
+    let mut app = headless_app(arena());
+    start_playing(&mut app);
+    aim_turret(&mut app, 1.0);
+    step(&mut app, 120);
+    assert_eq!(
+        turret_angle(&mut app),
+        1.0,
+        "a released stick means hold, not recentre"
+    );
+}
+
+#[test]
+fn a_factory_stands_on_every_cell_the_maze_put_one_on() {
+    let mut app = headless_app(real_maze(2024));
+    start_playing(&mut app);
+
+    let mut expected: Vec<Vec2> = {
+        let maze = app.world().resource::<Maze>();
+        maze.factories
+            .iter()
+            .map(|cell| maze.grid.cell_center(*cell))
+            .collect()
+    };
+    expected.sort_by(|a, b| a.x.total_cmp(&b.x).then(a.y.total_cmp(&b.y)));
+
+    assert!(!expected.is_empty(), "a level-one maze has factories in it");
+    assert_eq!(factory_centers(&mut app), expected);
+}
+
+#[test]
+fn holding_space_fires_at_the_rate_the_cooldown_sets() {
+    // Fired straight up in an open arena with the tank in the middle, so nothing
+    // is reached and every shell fired is still countable.
+    let mut app = headless_app(arena());
+    start_playing(&mut app);
+    let center = maze_center(&app);
+    place_tank(&mut app, center);
+    aim_turret(&mut app, FRAC_PI_2);
+
+    press(&mut app, KeyCode::Space);
+    step(&mut app, 1);
+    assert_eq!(count::<Shell>(&mut app), 1, "the first shot is immediate");
+
+    // A shell lives 0.9 s and one is fired every 0.45 s, so at most three are ever
+    // in the air at once. A gun with no rate limit would have fired 26 by now.
+    for tick in 0..26 {
+        step(&mut app, 1);
+        assert!(
+            count::<Shell>(&mut app) <= 1,
+            "tick {tick}: fired again inside the cooldown"
+        );
+    }
+    step(&mut app, 1);
+    assert_eq!(
+        count::<Shell>(&mut app),
+        2,
+        "the second shot is due 27 ticks after the first"
+    );
+}
+
+#[test]
+fn a_shell_takes_a_bite_out_of_a_factory_without_flattening_it() {
+    let mut app = headless_app(arena_with_factories(1));
+    start_playing(&mut app);
+    let factory = factory_centers(&mut app)[0];
+    let full_health = factory_health(&mut app);
+    assert!(
+        full_health > GUN.damage,
+        "a factory takes more than one shell"
+    );
+
+    take_aim_at(&mut app, factory);
+    press(&mut app, KeyCode::Space);
+    step(&mut app, 1);
+    release(&mut app, KeyCode::Space);
+    assert_eq!(
+        count::<Shell>(&mut app),
+        1,
+        "one shell should be in the air"
+    );
+
+    step(&mut app, 4);
+    assert_eq!(count::<Shell>(&mut app), 0, "and should have arrived");
+    assert_eq!(count::<Factory>(&mut app), 1, "one shell is not five");
+    assert_eq!(factory_health(&mut app), full_health - GUN.damage);
+}
+
+#[test]
+fn clearing_every_factory_ends_the_level_and_nothing_less_does() {
+    let mut app = headless_app(arena_with_factories(2));
+    start_playing(&mut app);
+    let factories = factory_centers(&mut app);
+    assert_eq!(factories.len(), 2);
+
+    shell_to_pieces(&mut app, factories[0]);
+    assert_eq!(
+        count::<Factory>(&mut app),
+        1,
+        "the first one should be down"
+    );
+    assert_eq!(
+        state(&app),
+        AppState::Playing,
+        "one factory left standing is not a cleared sector"
+    );
+
+    shell_to_pieces(&mut app, factories[1]);
+    assert_eq!(count::<Factory>(&mut app), 0);
+    assert_eq!(state(&app), AppState::LevelComplete);
+}
+
+#[test]
+fn a_cleared_level_stands_down_to_the_menu_with_nothing_left_behind() {
+    let mut app = headless_app(arena_with_factories(1));
+    start_playing(&mut app);
+    let factory = factory_centers(&mut app)[0];
+
+    shell_to_pieces(&mut app, factory);
+    assert_eq!(state(&app), AppState::LevelComplete);
+
+    tap(&mut app, KeyCode::Enter);
+    assert_eq!(state(&app), AppState::MainMenu);
+    assert_eq!(tank_count(&mut app), 0);
+    assert_eq!(count::<Shell>(&mut app), 0, "shells belong to the run");
+    assert_eq!(count::<Factory>(&mut app), 0);
+}
+
+#[test]
+fn abandoning_a_run_takes_the_factories_and_the_shells_in_flight_with_it() {
+    let mut app = headless_app(arena_with_factories(2));
+    start_playing(&mut app);
+    let center = maze_center(&app);
+    place_tank(&mut app, center);
+    aim_turret(&mut app, FRAC_PI_2);
+
+    press(&mut app, KeyCode::Space);
+    step(&mut app, 1);
+    assert_eq!(count::<Shell>(&mut app), 1);
+    assert_eq!(count::<Factory>(&mut app), 2);
+
+    tap(&mut app, KeyCode::Escape);
+    tap(&mut app, KeyCode::KeyQ);
+    assert_eq!(state(&app), AppState::MainMenu);
+    assert_eq!(count::<Shell>(&mut app), 0);
+    assert_eq!(count::<Factory>(&mut app), 0);
+}
+
+#[test]
+fn releasing_the_trigger_is_not_needed_to_stop_firing_into_a_pause() {
+    let mut app = headless_app(arena());
+    start_playing(&mut app);
+    let center = maze_center(&app);
+    place_tank(&mut app, center);
+    aim_turret(&mut app, FRAC_PI_2);
+
+    // Trigger held down through the pause, and never let go of.
+    press(&mut app, KeyCode::Space);
+    step(&mut app, 1);
+    tap(&mut app, KeyCode::Escape);
+    assert_eq!(state(&app), AppState::Paused);
+    let in_the_air = count::<Shell>(&mut app);
+
+    step(&mut app, 120);
+    assert_eq!(
+        count::<Shell>(&mut app),
+        in_the_air,
+        "a paused game must not fire, and its shells must not move"
+    );
+    assert_eq!(
+        shell_positions(&mut app),
+        shell_positions(&mut app),
+        "and this reads the same both times, so the comparison means something"
+    );
+}
+
+#[test]
+fn a_shell_gives_out_at_the_end_of_its_range() {
+    let mut app = headless_app(arena());
+    start_playing(&mut app);
+    let center = maze_center(&app);
+    place_tank(&mut app, center);
+    aim_turret(&mut app, 0.0);
+
+    press(&mut app, KeyCode::Space);
+    step(&mut app, 1);
+    release(&mut app, KeyCode::Space);
+    let muzzle = shell_positions(&mut app)[0];
+    // The far wall is 960 px away, well past the 576 px the shell has in it, so
+    // range is what ends this and not masonry.
+    assert!(maze_size(&app).x - CELL_SIZE - muzzle.x > GUN.range);
+
+    // Range at shell speed is 54 ticks. At 50 it is still short of it.
+    step(&mut app, 50);
+    let flying = shell_positions(&mut app);
+    assert_eq!(flying.len(), 1, "50 ticks is inside its range");
+    let travelled = flying[0].x - muzzle.x;
+    assert!(
+        travelled > GUN.range - CELL_SIZE && travelled <= GUN.range,
+        "should be a cell or so short of its {} px range, got {travelled}",
+        GUN.range
+    );
+
+    step(&mut app, 8);
+    assert_eq!(
+        count::<Shell>(&mut app),
+        0,
+        "58 ticks is past the end of it"
+    );
+}
+
+#[test]
+fn the_tank_cannot_drive_through_a_factory() {
+    let mut app = headless_app(arena_with_factories(1));
+    start_playing(&mut app);
+    let factory = factory_centers(&mut app)[0];
+
+    // Run at it head-on from whichever side of it has the room.
+    let (standoff, key) = if factory.x < maze_center(&app).x {
+        (CELL_SIZE * 3.0, KeyCode::KeyA)
+    } else {
+        (-CELL_SIZE * 3.0, KeyCode::KeyD)
+    };
+    place_tank(&mut app, factory + Vec2::new(standoff, 0.0));
+
+    press(&mut app, key);
+    step(&mut app, 240);
+
+    let at = tank_position(&mut app);
+    let gap = at.distance(factory);
+    assert!(
+        gap >= TANK_RADIUS + FACTORY_RADIUS - 0.1,
+        "drove into the building: only {gap} px between the two centres"
+    );
+    assert_eq!(
+        at.x < factory.x,
+        standoff < 0.0,
+        "ended up on the far side of the building at {at:?}"
+    );
+    assert_eq!(
+        tank_velocity(&mut app),
+        Vec2::ZERO,
+        "no speed may be banked against a building either"
+    );
+}
+
+#[test]
+fn no_shell_ever_ends_up_inside_a_wall() {
+    // What `collision::sweep` is for, exercised through the real schedule: driving
+    // and shooting in every direction around a real maze for twenty seconds.
+    let mut app = headless_app(real_maze(31337));
+    start_playing(&mut app);
+    let grid = app.world().resource::<Maze>().grid.clone();
+
+    press(&mut app, KeyCode::KeyW);
+    press(&mut app, KeyCode::KeyD);
+    press(&mut app, KeyCode::Space);
+    for tick in 0..1200 {
+        // Sweep the gun round so shots go out on every bearing rather than one.
+        aim_turret(&mut app, tick as f32 * 0.11);
+        step(&mut app, 1);
+        for at in shell_positions(&mut app) {
+            assert!(
+                collision::is_clear(&grid, at, SHELL_RADIUS),
+                "tick {tick}: a shell is inside a wall at {at:?}"
+            );
+        }
+        assert!(
+            count::<Shell>(&mut app) <= 3,
+            "tick {tick}: shells are not being cleaned up"
         );
     }
 }

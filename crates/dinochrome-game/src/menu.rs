@@ -12,6 +12,10 @@ pub struct MainMenuUi;
 #[derive(Component)]
 pub struct PauseUi;
 
+/// Marks entities belonging to the level-cleared overlay.
+#[derive(Component)]
+pub struct LevelCompleteUi;
+
 /// A full-screen, centred, vertically stacked overlay root.
 fn overlay_root(background: Color) -> impl Bundle {
     (
@@ -58,7 +62,14 @@ pub fn spawn_main_menu(mut commands: Commands) {
             heading("DINOCHROME", palette::AMBER),
             line("Dinochrome Brigade — armour command", palette::PHOSPHOR_DIM),
             line("Press ENTER or SPACE to deploy", palette::PHOSPHOR),
-            line("WASD to drive · ESC to pause", palette::PHOSPHOR_DIM),
+            line(
+                "Destroy every drone factory in the sector",
+                palette::PHOSPHOR
+            ),
+            line(
+                "WASD to drive · ARROWS to aim · SPACE to fire · ESC to pause",
+                palette::PHOSPHOR_DIM,
+            ),
         ],
     ));
 }
@@ -70,6 +81,25 @@ pub fn spawn_pause_overlay(mut commands: Commands) {
         children![
             heading("HOLDING", palette::AMBER),
             line("ESC to resume · Q to abandon the sortie", palette::PHOSPHOR),
+        ],
+    ));
+}
+
+/// The dispatch that comes in when the last factory goes down.
+///
+/// Terse on purpose, and M4 makes it a screen of its own with the sector's numbers
+/// on it. For now it is the acknowledgement that the win condition fired.
+pub fn spawn_level_complete_overlay(mut commands: Commands) {
+    commands.spawn((
+        LevelCompleteUi,
+        overlay_root(palette::SCRIM),
+        children![
+            heading("SECTOR CLEAR", palette::AMBER),
+            line(
+                "Brigade to unit: last factory confirmed destroyed. Well done.",
+                palette::PHOSPHOR,
+            ),
+            line("ENTER or SPACE to stand down", palette::PHOSPHOR_DIM),
         ],
     ));
 }

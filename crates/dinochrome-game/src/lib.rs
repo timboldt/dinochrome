@@ -10,11 +10,14 @@
 //! - [`DinochromePlugin`] — both of the above; what `main` adds.
 
 pub mod camera;
+pub mod factory;
 pub mod maze;
 pub mod menu;
 pub mod palette;
 pub mod player;
 pub mod state;
+pub mod turret;
+pub mod weapon;
 
 use bevy::app::{RunFixedMainLoop, RunFixedMainLoopSystems};
 use bevy::prelude::*;
@@ -30,18 +33,37 @@ impl Plugin for SimPlugin {
         app.insert_resource(Time::<Fixed>::from_hz(FIXED_HZ))
             .init_state::<AppState>()
             .init_resource::<maze::MazeConfig>()
-            // The maze and the tank outlive the pause state, so their lifetime is
-            // tied to leaving and re-entering the menu rather than to `Playing`.
-            // M4 hands this over to level progression.
+            // The maze, the tank and the factories outlive the pause state, so
+            // their lifetime is tied to leaving and re-entering the menu rather
+            // than to `Playing`. M4 hands this over to level progression.
             //
-            // Chained because the tank is placed on the maze's spawn cell: it
-            // cannot be created before the maze it stands in.
+            // Chained because both the tank and the factories are placed on cells
+            // the maze picked: neither can be created before the maze they stand
+            // in.
             .add_systems(
                 OnExit(AppState::MainMenu),
-                (maze::generate, player::spawn_tank).chain(),
+                (maze::generate, player::spawn_tank, factory::spawn_factories).chain(),
             )
-            .add_systems(OnEnter(AppState::MainMenu), player::despawn_tank)
-            .add_systems(OnEnter(AppState::Paused), player::clear_drive_input)
+            .add_systems(
+                OnEnter(AppState::MainMenu),
+                (
+                    player::despawn_tank,
+                    despawn_all::<factory::Factory>,
+                    despawn_all::<weapon::Shell>,
+                ),
+            )
+            // Leaving `Playing` for any reason — paused, cleared, abandoned — has
+            // to drop the held controls. Left set, they would be acted on the
+            // instant play resumed, so a tank paused mid-throttle would lurch and
+            // a held trigger would fire a shell into the pause screen.
+            .add_systems(
+                OnExit(AppState::Playing),
+                (
+                    player::clear_drive_input,
+                    turret::clear_aim_input,
+                    weapon::clear_fire_input,
+                ),
+            )
             .add_systems(
                 Update,
                 (
@@ -49,6 +71,7 @@ impl Plugin for SimPlugin {
                     state::toggle_pause
                         .run_if(in_state(AppState::Playing).or_else(in_state(AppState::Paused))),
                     state::quit_to_menu.run_if(in_state(AppState::Paused)),
+                    state::leave_level_complete.run_if(in_state(AppState::LevelComplete)),
                 ),
             )
             // `RunFixedMainLoop` runs *before* `Update`, so sampling input in
@@ -58,13 +81,30 @@ impl Plugin for SimPlugin {
             // what it said.
             .add_systems(
                 RunFixedMainLoop,
-                player::sample_drive_input
+                (
+                    player::sample_drive_input,
+                    turret::sample_aim_input,
+                    weapon::sample_fire_input,
+                )
                     .in_set(RunFixedMainLoopSystems::BeforeFixedMainLoop)
                     .run_if(in_state(AppState::Playing)),
             )
+            // One tick, in a fixed order, so the simulation is reproducible rather
+            // than merely correct. Shells move before the gun fires, so a shell
+            // spends its first tick sitting at the muzzle where the player can see
+            // it leave; and the dead are reaped after the shells have landed, so a
+            // factory destroyed this tick is gone this tick.
             .add_systems(
                 FixedUpdate,
-                player::move_tanks.run_if(in_state(AppState::Playing)),
+                (
+                    player::move_tanks,
+                    turret::slew_turrets,
+                    weapon::move_shells,
+                    weapon::fire_weapons,
+                    factory::destroy_dead_factories,
+                )
+                    .chain()
+                    .run_if(in_state(AppState::Playing)),
             );
     }
 }
@@ -92,9 +132,21 @@ impl Plugin for PresentationPlugin {
             .add_systems(OnEnter(AppState::Paused), menu::spawn_pause_overlay)
             .add_systems(OnExit(AppState::Paused), despawn_all::<menu::PauseUi>)
             .add_systems(
+                OnEnter(AppState::LevelComplete),
+                menu::spawn_level_complete_overlay,
+            )
+            .add_systems(
+                OnExit(AppState::LevelComplete),
+                despawn_all::<menu::LevelCompleteUi>,
+            )
+            .add_systems(
                 Update,
                 (
                     player::attach_tank_sprite,
+                    weapon::attach_shell_sprites,
+                    factory::attach_factory_sprites,
+                    factory::show_factory_damage,
+                    turret::sync_barrels,
                     // Left running while paused so that a glide already in
                     // flight settles instead of freezing half-way.
                     camera::follow_tank
