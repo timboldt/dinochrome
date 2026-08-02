@@ -19,7 +19,7 @@ pub mod maze;
 pub mod turret;
 pub mod weapon;
 
-pub use grid::{CELL_SIZE, Cell, Grid};
+pub use grid::{Aabb, CELL_SIZE, Cell, Grid, WALL_THICKNESS, WallShape};
 pub use maze::{Maze, MazeParams};
 
 /// Simulation tick rate, in hertz.

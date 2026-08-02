@@ -7,7 +7,6 @@
 //! [`SimPlugin`]: crate::SimPlugin
 
 use bevy::prelude::*;
-use dinochrome_core::grid::CELL_SIZE;
 use dinochrome_core::maze::{self, MazeParams};
 
 use crate::palette;
@@ -63,20 +62,28 @@ pub fn generate(mut commands: Commands, config: Res<MazeConfig>, real: Res<Time<
     commands.insert_resource(Maze(maze));
 }
 
-/// Draws one sprite per wall cell.
+/// Draws the maze's walls.
 ///
-/// A level-one maze is a few hundred sprites and the largest planned maze is
-/// under two thousand, which Bevy's 2D batcher handles without noticing. Merging
-/// runs of wall into single stretched quads would cut that further, but there is
-/// no measured reason to.
+/// A wall cell is not a solid square — it is a thin bar through the cell centre,
+/// or a crossed pair of them at a junction, and `wall_boxes` is what works that
+/// out. Drawing exactly the boxes collision resolves against is the point: there
+/// is no second description of the maze's shape to drift out of step with the
+/// first.
+///
+/// That comes to roughly one and a fifth sprites per wall cell — a level-one
+/// maze is a few hundred, the largest planned maze around two thousand, which
+/// Bevy's 2D batcher handles without noticing. Merging collinear runs into
+/// single stretched quads would cut it further, but there is no measured reason
+/// to.
 pub fn render_walls(mut commands: Commands, maze: Res<Maze>) {
-    let block = Sprite::from_color(palette::WALL, Vec2::splat(CELL_SIZE));
     for cell in maze.grid.walls() {
-        let at = maze.grid.cell_center(cell);
-        commands.spawn((
-            MazeWall,
-            block.clone(),
-            Transform::from_xyz(at.x, at.y, Z_WALL),
-        ));
+        for wall in maze.grid.wall_boxes(cell).iter() {
+            let at = wall.center();
+            commands.spawn((
+                MazeWall,
+                Sprite::from_color(palette::WALL, wall.size()),
+                Transform::from_xyz(at.x, at.y, Z_WALL),
+            ));
+        }
     }
 }

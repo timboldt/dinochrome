@@ -102,17 +102,30 @@ fn the_menu_is_up_and_the_camera_exists_before_anything_else_does() {
 }
 
 #[test]
-fn starting_a_run_draws_one_sprite_per_wall_cell() {
+fn starting_a_run_draws_one_sprite_per_wall_box() {
     let mut app = app();
     tap(&mut app, KeyCode::Enter);
     assert_eq!(state(&app), AppState::Playing);
 
-    let expected = app.world().resource::<Maze>().grid.walls().count();
-    assert!(expected > 0, "a level-one maze has walls");
+    // A wall cell is drawn as the thin bars `wall_boxes` derives for it — one
+    // for a straight run or a stub, two where bars cross — so the sprite count
+    // tracks the boxes rather than the cells.
+    let grid = &app.world().resource::<Maze>().grid;
+    let cells = grid.walls().count();
+    let expected: usize = grid
+        .walls()
+        .map(|cell| grid.wall_boxes(cell).iter().count())
+        .sum();
+
+    assert!(cells > 0, "a level-one maze has walls");
+    assert!(
+        expected > cells,
+        "a maze with junctions in it needs more boxes than cells: {expected} vs {cells}"
+    );
     assert_eq!(
         count::<MazeWall>(&mut app),
         expected,
-        "every wall cell should have been drawn exactly once"
+        "every wall box should have been drawn exactly once"
     );
     assert_eq!(count::<MainMenuUi>(&mut app), 0, "the menu should be gone");
 }

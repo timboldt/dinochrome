@@ -8,11 +8,16 @@
 //!
 //! # Sliding
 //!
-//! Entities are circles; walls are the axis-aligned squares of the grid. A move
-//! is resolved one axis at a time — X first with the old Y, then Y with the new
-//! X — which is what gives wall sliding for free: a diagonal push into a wall
-//! loses the component that is blocked and keeps the one that is not, with no
-//! special case for it anywhere.
+//! Entities are circles; walls are axis-aligned boxes. A move is resolved one
+//! axis at a time — X first with the old Y, then Y with the new X — which is
+//! what gives wall sliding for free: a diagonal push into a wall loses the
+//! component that is blocked and keeps the one that is not, with no special case
+//! for it anywhere.
+//!
+//! The boxes are not the grid cells. A wall cell is solid only along a thin bar
+//! through its middle ([`Grid::wall_boxes`]), so the grid is used to decide
+//! *which* cells to look at and the boxes decide what is solid once there. That
+//! keeps the broad phase the same cheap integer cell walk it always was.
 //!
 //! Resolution against a single wall is exact circle geometry rather than a box
 //! approximation. Where the circle's centre is level with a wall face the
@@ -34,14 +39,20 @@
 
 use glam::{BVec2, IVec2, Vec2};
 
-use crate::grid::{CELL_SIZE, Grid};
+use crate::grid::{CELL_SIZE, Grid, WALL_THICKNESS};
 
 /// Longest distance resolved in one substep, in world units.
 ///
-/// Half a cell. A wall is a full cell thick, so a substep this short cannot
-/// straddle one: the swept span always intersects any wall it crosses, and the
-/// clamp sees it.
-pub const MAX_SUBSTEP: f32 = CELL_SIZE * 0.5;
+/// Half a wall's thickness, so a substep this short cannot straddle one: the
+/// swept span always intersects any wall it crosses, and the clamp sees it. It
+/// is well under a blocker's radius too, so nothing steps clean over a building
+/// either.
+///
+/// Tied to [`WALL_THICKNESS`] rather than to the cell, because it is the solid
+/// part a move must not skip and walls are a quarter of a cell thick. The tank
+/// covers three pixels in a tick, so this costs nothing in practice; it is the
+/// guard that lets callers not think about velocity at all.
+pub const MAX_SUBSTEP: f32 = WALL_THICKNESS * 0.5;
 
 /// Slack, in world units, before a contact counts as an overlap.
 ///
@@ -173,15 +184,13 @@ pub fn sweep(grid: &Grid, from: Vec2, radius: f32, delta: Vec2) -> Sweep {
         for y in low.y..=high.y {
             for x in low.x..=high.x {
                 let cell = IVec2::new(x, y);
-                if !grid.is_wall(cell) {
-                    continue;
-                }
-                let (min, max) = (grid.cell_min(cell), grid.cell_max(cell));
-                if let Some(t) = hit_cell(from, delta, radius, min, max)
-                    && t < travel
-                {
-                    travel = t;
-                    hit = Some(cell);
+                for wall in grid.wall_boxes(cell).iter() {
+                    if let Some(t) = hit_box(from, delta, radius, wall.min, wall.max)
+                        && t < travel
+                    {
+                        travel = t;
+                        hit = Some(cell);
+                    }
                 }
             }
         }
@@ -238,7 +247,7 @@ pub fn hit_circle(
 /// ray enters the inflated *square*; if that happens level with one of the faces
 /// it is the answer, and if it happens off the end of both then the real contact
 /// is against a rounded corner, which is a ray/circle solve.
-fn hit_cell(from: Vec2, delta: Vec2, radius: f32, min: Vec2, max: Vec2) -> Option<f32> {
+fn hit_box(from: Vec2, delta: Vec2, radius: f32, min: Vec2, max: Vec2) -> Option<f32> {
     let grown_min = min - Vec2::splat(radius);
     let grown_max = max + Vec2::splat(radius);
 
@@ -308,18 +317,14 @@ fn push_out(position: Vec2, radius: f32, blockers: &[Blocker]) -> Vec2 {
 pub fn is_clear(grid: &Grid, position: Vec2, radius: f32) -> bool {
     let low = grid.cell_at(position - Vec2::splat(radius));
     let high = grid.cell_at(position + Vec2::splat(radius));
+    let allowed = (radius - SKIN).max(0.0);
     for y in low.y..=high.y {
         for x in low.x..=high.x {
-            let cell = IVec2::new(x, y);
-            if !grid.is_wall(cell) {
-                continue;
-            }
-            let min = grid.cell_min(cell);
-            let max = grid.cell_max(cell);
-            let nearest = position.clamp(min, max);
-            let allowed = (radius - SKIN).max(0.0);
-            if position.distance_squared(nearest) < allowed * allowed {
-                return false;
+            for wall in grid.wall_boxes(IVec2::new(x, y)).iter() {
+                let nearest = wall.nearest(position);
+                if position.distance_squared(nearest) < allowed * allowed {
+                    return false;
+                }
             }
         }
     }
@@ -365,37 +370,42 @@ fn resolve(grid: &Grid, position: Vec2, radius: f32, step: f32, axis: Axis) -> f
                 Axis::X => IVec2::new(along, cross),
                 Axis::Y => IVec2::new(cross, along),
             };
-            if !grid.is_wall(cell) {
-                continue;
-            }
+            // The cell says where to look; the boxes say what is actually solid
+            // there. A cell contributes at most two, and each is constrained
+            // against independently — their union is the wall's real shape, and
+            // taking the tightest clamp over them is that union exactly.
+            for wall in grid.wall_boxes(cell).iter() {
+                let (along_min, along_max, cross_min, cross_max) = match axis {
+                    Axis::X => (wall.min.x, wall.max.x, wall.min.y, wall.max.y),
+                    Axis::Y => (wall.min.y, wall.max.y, wall.min.x, wall.max.x),
+                };
 
-            // How far the circle's surface reaches along the axis of travel, at
-            // the offset `fixed` sits at relative to this wall.
-            let (cross_min, cross_max) = cell_bounds(cross);
-            let Some(reach) = axis_reach(radius, fixed, cross_min, cross_max) else {
-                continue;
-            };
+                // How far the circle's surface reaches along the axis of travel,
+                // at the offset `fixed` sits at relative to this wall.
+                let Some(reach) = axis_reach(radius, fixed, cross_min, cross_max) else {
+                    continue;
+                };
 
-            // Only the face being approached constrains anything. A wall the
-            // circle is already past on this axis is behind it, and clamping to
-            // that wall's near face would drag the circle backwards across the
-            // whole cell — which is what happens when a tank slides along the
-            // top of a block and then tries to move further along it.
-            //
-            // The comparison is the circle's *current* coordinate, not its
-            // target: the question is which side it started on. `SKIN` keeps a
-            // circle already resting flush against the face on the near side of
-            // it, so contact does not become passage.
-            let (along_min, along_max) = cell_bounds(along);
-            if step > 0.0 {
-                let limit = along_min - reach;
-                if moving <= limit + SKIN {
-                    resolved = resolved.min(limit);
-                }
-            } else {
-                let limit = along_max + reach;
-                if moving >= limit - SKIN {
-                    resolved = resolved.max(limit);
+                // Only the face being approached constrains anything. A wall the
+                // circle is already past on this axis is behind it, and clamping
+                // to that wall's near face would drag the circle backwards
+                // across it — which is what happens when a tank slides along the
+                // top of a block and then tries to move further along it.
+                //
+                // The comparison is the circle's *current* coordinate, not its
+                // target: the question is which side it started on. `SKIN` keeps
+                // a circle already resting flush against the face on the near
+                // side of it, so contact does not become passage.
+                if step > 0.0 {
+                    let limit = along_min - reach;
+                    if moving <= limit + SKIN {
+                        resolved = resolved.min(limit);
+                    }
+                } else {
+                    let limit = along_max + reach;
+                    if moving >= limit - SKIN {
+                        resolved = resolved.max(limit);
+                    }
                 }
             }
         }
@@ -430,12 +440,6 @@ fn cell_span(low: f32, high: f32) -> (i32, i32) {
         (low / CELL_SIZE).floor() as i32,
         (high / CELL_SIZE).floor() as i32,
     )
-}
-
-/// World span of the cell at index `index`, on either axis.
-fn cell_bounds(index: i32) -> (f32, f32) {
-    let min = index as f32 * CELL_SIZE;
-    (min, min + CELL_SIZE)
 }
 
 #[cfg(test)]
@@ -488,8 +492,25 @@ mod tests {
         Vec2::new(x as f32 + 0.5, y as f32 + 0.5) * C
     }
 
-    /// The tank's collider: comfortably inside a one-cell corridor.
+    /// The tank's collider: comfortably inside a corridor.
     const R: f32 = 22.0;
+
+    /// How far a wall line reaches either side of its cell centre.
+    const HALF_WALL: f32 = WALL_THICKNESS * 0.5;
+
+    /// World coordinate of the low face of the wall line in cell `index`.
+    ///
+    /// Walls run down the middle of their cells, so a wall's face is *not* the
+    /// cell boundary — it is half a thickness off the cell centre. Every test
+    /// that wants to know where a circle comes to rest goes through these.
+    fn face_min(index: i32) -> f32 {
+        (index as f32 + 0.5) * C - HALF_WALL
+    }
+
+    /// World coordinate of the high face of the wall line in cell `index`.
+    fn face_max(index: i32) -> f32 {
+        (index as f32 + 0.5) * C + HALF_WALL
+    }
 
     #[test]
     fn a_zero_move_changes_nothing_and_blocks_nothing() {
@@ -521,9 +542,10 @@ mod tests {
         let start = at(1, 1);
         // Far more than the two cells of corridor there is room for.
         let result = slide(&grid, start, R, Vec2::new(C * 10.0, 0.0));
-        // The wall at cell (4,1) starts at x == 4 * CELL_SIZE.
+        // The wall line in cell (4,1) presents its low face half a thickness
+        // short of the cell centre — not at the cell boundary.
         assert!(
-            (result.position.x - (4.0 * C - R)).abs() < 1e-3,
+            (result.position.x - (face_min(4) - R)).abs() < 1e-3,
             "got {}",
             result.position.x
         );
@@ -535,9 +557,9 @@ mod tests {
     #[test]
     fn a_circle_already_touching_a_wall_cannot_push_into_it() {
         let grid = junction();
-        // Exactly flush against the left wall of the corridor, which ends at
-        // x == CELL_SIZE.
-        let start = Vec2::new(C + R, at(1, 1).y);
+        // Exactly flush against the left wall of the corridor, whose face is
+        // half a thickness past the centre of cell column 0.
+        let start = Vec2::new(face_max(0) + R, at(1, 1).y);
         let result = slide(&grid, start, R, Vec2::new(-C, 0.0));
         assert!(
             (result.position.x - start.x).abs() < 1e-4,
@@ -551,15 +573,17 @@ mod tests {
     fn a_diagonal_push_into_a_flat_wall_keeps_the_tangential_component() {
         let grid = junction();
         let start = at(2, 1);
-        // Down and to the right; down is into the corridor's bottom wall.
-        let result = slide(&grid, start, R, Vec2::new(C * 0.5, -C * 0.5));
+        // Down and to the right; down is into the corridor's bottom wall. The
+        // drop has to clear half a cell more than it used to: the wall line sits
+        // in the middle of the border row, not along its inner edge.
+        let result = slide(&grid, start, R, Vec2::new(C, -C));
         assert!(
             result.position.x > start.x + C * 0.4,
             "should have slid along the wall: got {:?}",
             result.position
         );
         assert!(
-            (result.position.y - (C + R)).abs() < 1e-3,
+            (result.position.y - (face_max(0) + R)).abs() < 1e-3,
             "should rest on the wall face: got {}",
             result.position.y
         );
@@ -572,8 +596,9 @@ mod tests {
         let start = at(1, 1);
         // Into the corner where the left wall and the bottom wall meet.
         let result = slide(&grid, start, R, Vec2::new(-C * 2.0, -C * 2.0));
+        let rest = face_max(0) + R;
         assert!(
-            (result.position - Vec2::new(C + R, C + R)).length() < 1e-3,
+            (result.position - Vec2::splat(rest)).length() < 1e-3,
             "got {:?}",
             result.position
         );
@@ -601,23 +626,54 @@ mod tests {
     }
 
     #[test]
-    fn a_circle_squeezes_between_two_walls_it_exactly_fits_through() {
-        // The gap at x == 2 is one cell wide, so a radius of exactly half a cell
-        // fits with nothing to spare.
+    fn a_circle_that_exactly_fits_a_corridor_runs_down_it_without_scraping() {
+        // Wall lines down cell columns 1 and 3. Because the lines are thin and
+        // sit at the cell centres, the corridor between them is a whole cell
+        // wider than the single open column suggests.
         let grid = Grid::from_rows(&[
             "#####", //
-            "#.#.#", //
-            "#...#", //
-            "#.#.#", //
+            "##.##", //
+            "##.##", //
+            "##.##", //
             "#####", //
         ]);
-        let start = at(2, 2);
-        let result = slide(&grid, start, C * 0.5, Vec2::new(0.0, C));
+        let free = face_min(3) - face_max(1);
+        assert_eq!(free, 2.0 * C - WALL_THICKNESS, "corridor free width");
+
+        // A circle of exactly half that width fits with nothing to spare, and
+        // "nothing to spare" has to mean it still passes.
+        let start = at(2, 1);
+        let result = slide(&grid, start, free * 0.5, Vec2::new(0.0, C));
         assert!(
-            (result.position.y - start.y).abs() < 1e-3,
-            "a circle that only just fits the gap cannot enter it: got {}",
+            (result.position.y - (start.y + C)).abs() < 1e-3,
+            "an exact fit should travel its whole move: got {}",
             result.position.y
         );
+        assert_eq!(
+            result.blocked,
+            BVec2::FALSE,
+            "an exact fit should not scrape"
+        );
+    }
+
+    #[test]
+    fn a_circle_too_wide_for_a_corridor_jams_in_its_mouth() {
+        let grid = Grid::from_rows(&[
+            "#####", //
+            "##.##", //
+            "##.##", //
+            "##.##", //
+            "#####", //
+        ]);
+        let start = at(2, 1);
+        let too_fat = (face_min(3) - face_max(1)) * 0.5 + 1.0;
+        let result = slide(&grid, start, too_fat, Vec2::new(0.0, C));
+        assert!(
+            result.position.y < start.y + C - 1.0,
+            "should have wedged rather than driven through: got {}",
+            result.position.y
+        );
+        assert!(result.blocked.y);
     }
 
     #[test]
@@ -752,7 +808,7 @@ mod tests {
         let result = sweep(&grid, from, radius, Vec2::new(C * 10.0, 0.0));
         assert_eq!(result.hit, Some(IVec2::new(4, 1)));
         assert!(
-            (result.position.x - (4.0 * C - radius)).abs() < 1e-3,
+            (result.position.x - (face_min(4) - radius)).abs() < 1e-3,
             "got {}",
             result.position.x
         );
@@ -774,12 +830,13 @@ mod tests {
 
     #[test]
     fn a_sweep_grazing_a_convex_corner_stops_on_the_corner_and_not_the_face() {
-        // Along the row above the block in cell (2,2), passing 4 px over its
-        // top-left corner. A square-cornered test would have clamped this to the
-        // block's left face, a radius too early.
+        // The block in cell (2,2) has nothing to join onto, so it is a lone post
+        // one thickness square about the cell centre. This passes 4 px over its
+        // top-left corner. A square-cornered test would have clamped to the
+        // post's left face, a radius too early.
         let grid = room();
         let radius = 6.0;
-        let corner = Vec2::new(2.0 * C, 3.0 * C);
+        let corner = Vec2::new(face_min(2), face_max(2));
         let from = Vec2::new(C * 1.5, corner.y + 4.0);
         let result = sweep(&grid, from, radius, Vec2::new(C * 2.0, 0.0));
         assert_eq!(result.hit, Some(IVec2::new(2, 2)));
@@ -800,7 +857,7 @@ mod tests {
         let grid = room();
         let radius = 6.0;
         // A hair further over the same corner than the radius reaches.
-        let from = Vec2::new(C * 1.5, 3.0 * C + radius + 0.5);
+        let from = Vec2::new(C * 1.5, face_max(2) + radius + 0.5);
         let result = sweep(&grid, from, radius, Vec2::new(C * 2.0, 0.0));
         assert_eq!(result.hit, None, "landed at {:?}", result.position);
     }

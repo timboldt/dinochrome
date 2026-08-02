@@ -20,7 +20,7 @@ use bevy::state::app::StatesPlugin;
 use bevy::time::TimeUpdateStrategy;
 use dinochrome_core::maze::MazeParams;
 use dinochrome_core::weapon::WeaponParams;
-use dinochrome_core::{CELL_SIZE, collision};
+use dinochrome_core::{CELL_SIZE, WALL_THICKNESS, collision};
 use dinochrome_game::factory::{FACTORY_RADIUS, Factory};
 use dinochrome_game::maze::{Maze, MazeConfig};
 use dinochrome_game::player::{DriveCommand, Tank, Velocity};
@@ -186,11 +186,18 @@ fn maze_center(app: &App) -> Vec2 {
     maze_size(app) * 0.5
 }
 
-/// Where the tank comes to rest flush in the top-right corner of an open arena.
+/// How far the inner face of the border wall lies from the edge of the world.
 ///
-/// The border ring is one cell thick, so the last open cell ends one cell in.
+/// The border ring is a cell thick, but its *wall* is a thin line down the
+/// middle of that cell, so the floor reaches half a cell further out than the
+/// ring's inner edge — which is where anything driving into it comes to rest.
+fn border_face() -> f32 {
+    CELL_SIZE * 0.5 + WALL_THICKNESS * 0.5
+}
+
+/// Where the tank comes to rest flush in the top-right corner of an open arena.
 fn arena_far_corner(app: &App) -> Vec2 {
-    maze_size(app) - Vec2::splat(CELL_SIZE + TANK_RADIUS)
+    maze_size(app) - Vec2::splat(border_face() + TANK_RADIUS)
 }
 
 /// Which way the turret is pointing, in radians.
@@ -464,7 +471,7 @@ fn the_tank_slides_along_a_wall_it_is_pushed_into_at_an_angle() {
     let mut app = headless_app(arena());
     start_playing(&mut app);
     // Flush against the bottom wall, half way along it.
-    let floor = CELL_SIZE + TANK_RADIUS;
+    let floor = border_face() + TANK_RADIUS;
     let start = Vec2::new(maze_center(&app).x, floor);
     place_tank(&mut app, start);
 
