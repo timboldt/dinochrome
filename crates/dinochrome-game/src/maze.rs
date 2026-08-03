@@ -7,6 +7,7 @@
 //! [`SimPlugin`]: crate::SimPlugin
 
 use bevy::prelude::*;
+use dinochrome_core::SimRng;
 use dinochrome_core::maze::{self, MazeParams};
 
 use crate::palette;
@@ -23,23 +24,54 @@ const Z_WALL: f32 = -1.0;
 #[derive(Resource, Debug, Deref)]
 pub struct Maze(pub maze::Maze);
 
+/// The run's source of randomness for everything after the maze itself.
+///
+/// Seeded from the same number the maze is, and replaced whenever a new maze is
+/// generated, so a seed reproduces the whole run and not merely its walls: the
+/// same maze, the same drones out of the same factories in the same order, going
+/// the same way. That is what makes a seed worth printing when someone reports a
+/// bug about a level they could not clear.
+#[derive(Resource, Debug, Deref, DerefMut)]
+pub struct SimRandom(pub SimRng);
+
 /// What to generate for the next level.
 ///
 /// M4 turns this into the level-progression knob — bigger and denser each level.
 /// For now it is here so that tests can ask for a maze they can predict.
-#[derive(Resource, Debug, Clone, Default)]
+#[derive(Resource, Debug, Clone)]
 pub struct MazeConfig {
     /// Size and wall density.
     pub params: MazeParams,
     /// A fixed seed, or `None` to take one from the clock at level start.
     pub seed: Option<u64>,
+    /// Which level this is, counting from one.
+    ///
+    /// Only the drone mix reads it so far — see [`dinochrome_core::drone`], where
+    /// each kind unlocks at a level and the mix shifts toward the harder ones.
+    /// M4 makes the maze itself grow with it.
+    pub level: u32,
+}
+
+impl Default for MazeConfig {
+    /// The first level, on a maze picked fresh each run.
+    ///
+    /// Written out rather than derived because the level counts from one and a
+    /// derived default would start it at zero — which is a level at which no kind
+    /// of drone has been unlocked yet.
+    fn default() -> Self {
+        Self {
+            params: MazeParams::default(),
+            seed: None,
+            level: 1,
+        }
+    }
 }
 
 /// Marks a wall sprite, so the whole drawn maze can be cleared in one pass.
 #[derive(Component)]
 pub struct MazeWall;
 
-/// Generates the maze for a new run.
+/// Generates the maze for a new run, and the random source that goes with it.
 pub fn generate(mut commands: Commands, config: Res<MazeConfig>, real: Res<Time<Real>>) {
     // Native and wasm share no entropy source that does not drag in a
     // JS-backed `getrandom` — but they do share a clock, and how long the player
@@ -53,13 +85,20 @@ pub fn generate(mut commands: Commands, config: Res<MazeConfig>, real: Res<Time<
     // Printed so that a maze someone got stuck in can be regenerated exactly
     // from a bug report.
     info!(
-        "maze {}x{}, density {:.3}, seed {}",
+        "level {}, maze {}x{}, density {:.3}, seed {}",
+        config.level,
         maze.grid.width(),
         maze.grid.height(),
         maze.wall_density(),
         seed,
     );
     commands.insert_resource(Maze(maze));
+    // Offset so that the run's rolls are not the maze generator's own sequence
+    // replayed from the start. Same seed in, same run out; different concerns,
+    // different streams.
+    commands.insert_resource(SimRandom(SimRng::from_seed(
+        seed ^ 0x51_4E_47_5F_44_52_4F_4E,
+    )));
 }
 
 /// Draws the maze's walls.

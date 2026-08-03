@@ -10,23 +10,72 @@
 //! free choice: `maze::pick_factories` places them only on cells the rest of the
 //! maze does not route through, which is what keeps a level winnable.
 //!
-//! In M2 they are targets and nothing more. M3 gives them the drones.
+//! A factory does two things besides standing there and taking damage: it builds
+//! drones on a timer, and it shoots back at anything that gets close enough to be
+//! camping it.
+//!
+//! Both of those are limits rather than features. Unbounded production would let a
+//! player who ignored a factory come back to a maze full of drones, so a factory
+//! may only have so many of its own alive at once ([`LIVE_CAP`]); and a factory
+//! that could not defend itself would make parking outside its door the whole
+//! game, so it has a gun that reaches four cells and no further.
 //!
 //! [`Blocker`]: dinochrome_core::collision::Blocker
 
 use bevy::prelude::*;
 use dinochrome_core::collision::Blocker;
-use dinochrome_core::health;
+use dinochrome_core::{FIXED_DT, drone as core_drone, health, los, turret as core_turret, weapon};
 
-use crate::maze::Maze;
+use crate::drone::{self, BuiltBy};
+use crate::maze::{Maze, MazeConfig, SimRandom};
 use crate::palette;
-use crate::player::GridCollider;
+use crate::player::{GridCollider, Tank};
 use crate::state::AppState;
-use crate::weapon::Health;
+use crate::turret::{AimCommand, Traverse, Turret};
+use crate::weapon::{Faction, FireCommand, Health, Muzzle, Weapon};
 
-/// Marks a drone factory.
+/// Marks a drone factory, and holds its production line.
 #[derive(Component, Debug)]
-pub struct Factory;
+pub struct Factory {
+    /// Seconds until the next drone rolls out.
+    pub countdown: f32,
+    /// How many this factory has built since the level started.
+    ///
+    /// Not a limit — it only ever goes up. It is the serial number that staggers
+    /// its drones' route recomputes so a fleet does not all think on the same tick.
+    pub built: u32,
+}
+
+/// How many of its own drones a factory may have alive at once.
+///
+/// The answer to camping from the other direction. A player who parks somewhere
+/// safe and farms a factory should run out of things to shoot, not be buried; six
+/// is enough to make a factory's neighbourhood genuinely dangerous and few enough
+/// that clearing it out stays possible.
+pub const LIVE_CAP: usize = 6;
+
+/// Seconds between drones, when there is room for another.
+const SPAWN_INTERVAL: f32 = 3.5;
+
+/// Seconds before a factory at its cap tries again.
+///
+/// Short, and deliberately not the full interval: the point of the cap is to bound
+/// how many drones exist, not to reward the player with a lull for having killed
+/// one. But it is not zero either, because retrying every tick would mean counting
+/// the live drones sixty times a second for nothing.
+const CAP_RETRY: f32 = 0.5;
+
+/// How far a factory can see to shoot, in pixels.
+///
+/// Its gun's full range, so it never declines a shot it could land — see
+/// [`weapon::WeaponParams::FACTORY`] for why that range is as short as it is.
+const DEFENCE_RANGE: f32 = weapon::WeaponParams::FACTORY.range;
+
+/// How far off the bearing a factory's gun may be and still fire, in radians.
+const AIM_TOLERANCE: f32 = 0.12;
+
+/// How far a factory's muzzle sits from its centre, in pixels.
+const FACTORY_MUZZLE: f32 = FACTORY_RADIUS + 6.0;
 
 /// Marks a factory's core sprite: the bright middle you aim at.
 #[derive(Component)]
@@ -58,15 +107,126 @@ const Z_FACTORY: f32 = -0.5;
 const Z_CORE: f32 = 0.1;
 
 /// Creates a factory on each of the maze's factory cells.
+///
+/// Every factory starts with a full interval on the clock rather than shipping a
+/// drone the instant the level begins, so the opening seconds are navigation
+/// rather than an ambush.
 pub fn spawn_factories(mut commands: Commands, maze: Res<Maze>) {
     for &cell in &maze.factories {
         let at = maze.grid.cell_center(cell);
         commands.spawn((
-            Factory,
+            Factory {
+                countdown: SPAWN_INTERVAL,
+                built: 0,
+            },
+            Faction::Hostile,
             Health(health::Health::new(FACTORY_HEALTH)),
             GridCollider(FACTORY_RADIUS),
+            Turret::default(),
+            Traverse(core_turret::TurretParams::FACTORY),
+            AimCommand::default(),
+            Weapon(weapon::Weapon::new(weapon::WeaponParams::FACTORY)),
+            Muzzle(FACTORY_MUZZLE),
+            FireCommand::default(),
             Transform::from_xyz(at.x, at.y, Z_FACTORY),
         ));
+    }
+}
+
+/// Builds drones, on a timer and up to a cap.
+///
+/// A drone is put down on an open cell *next to* the factory rather than inside
+/// it. The building is wide enough to fill most of its own cell, so a drone
+/// spawned on top of one would start the game being shoved out of it.
+pub fn build_drones(
+    mut commands: Commands,
+    maze: Res<Maze>,
+    config: Res<MazeConfig>,
+    mut rng: ResMut<SimRandom>,
+    mut factories: Query<(Entity, &Transform, &mut Factory)>,
+    built: Query<&BuiltBy>,
+) {
+    for (entity, transform, mut factory) in &mut factories {
+        factory.countdown -= FIXED_DT;
+        if factory.countdown > 0.0 {
+            continue;
+        }
+
+        // Counted rather than tracked on the factory, because a drone can die to
+        // anything at any time and a counter maintained from three places is a
+        // counter that eventually disagrees with the world. At a cap of six
+        // against a handful of factories this is a few dozen comparisons, twice a
+        // second, per factory at its limit.
+        let live = built.iter().filter(|by| by.0 == entity).count();
+        if live >= LIVE_CAP {
+            factory.countdown = CAP_RETRY;
+            continue;
+        }
+
+        let at = transform.translation.truncate();
+        let cell = maze.grid.cell_at(at);
+        let doors: Vec<_> = maze.grid.open_neighbours(cell).collect();
+        let Some(door) = rng.below(doors.len()).map(|index| doors[index]) else {
+            // A factory with no open cell beside it cannot ship, and never will —
+            // but maze generation refuses to place one anywhere that could be
+            // walled in, so this is a belt-and-braces case rather than a real one.
+            factory.countdown = SPAWN_INTERVAL;
+            continue;
+        };
+
+        let kind = core_drone::kind_at(config.level, rng.unit());
+        drone::spawn(
+            &mut commands,
+            kind,
+            maze.grid.cell_center(door),
+            door,
+            entity,
+            factory.built,
+        );
+        factory.built += 1;
+        factory.countdown = SPAWN_INTERVAL;
+    }
+}
+
+/// Every factory's gun, and where it is pointing.
+type Defences<'w, 's> = Query<
+    'w,
+    's,
+    (
+        &'static Transform,
+        &'static Turret,
+        &'static mut AimCommand,
+        &'static mut FireCommand,
+    ),
+    (With<Factory>, Without<Tank>),
+>;
+
+/// Points each factory's gun at the player, and fires it if the player is close
+/// enough to be worth the ammunition.
+pub fn aim_defences(
+    maze: Res<Maze>,
+    tanks: Query<&Transform, With<Tank>>,
+    mut factories: Defences,
+) {
+    let quarry = tanks.iter().next().map(|at| at.translation.truncate());
+
+    for (transform, turret, mut aim, mut fire) in &mut factories {
+        let at = transform.translation.truncate();
+        let Some(quarry) =
+            quarry.filter(|quarry| los::visible(&maze.grid, at, *quarry, DEFENCE_RANGE))
+        else {
+            // A turret with nothing asked of it holds its bearing, so a factory
+            // stays pointed where it last saw you. That is the warning that you
+            // are coming back into its arc.
+            aim.0 = Vec2::ZERO;
+            fire.0 = false;
+            continue;
+        };
+
+        let bearing = quarry - at;
+        aim.0 = bearing;
+        let off = core_turret::wrap_angle(bearing.to_angle() - turret.0);
+        fire.0 = off.abs() <= AIM_TOLERANCE;
     }
 }
 
@@ -117,16 +277,20 @@ type UndrawnFactories<'w, 's> =
 type DamagedFactories<'w, 's> =
     Query<'w, 's, (&'static Health, &'static mut Sprite), (With<Factory>, Changed<Health>)>;
 
-/// Gives every factory its sprites: a body, and a core inside it.
+/// Gives every factory its sprites: a body, a core inside it, and the gun it
+/// defends itself with.
 pub fn attach_factory_sprites(mut commands: Commands, factories: UndrawnFactories) {
     for (entity, health) in &factories {
         commands.entity(entity).insert((
             Sprite::from_color(damage_tint(health), FACTORY_SIZE),
-            children![(
-                FactoryCore,
-                Sprite::from_color(palette::FACTORY_CORE, CORE_SIZE),
-                Transform::from_xyz(0.0, 0.0, Z_CORE),
-            )],
+            children![
+                (
+                    FactoryCore,
+                    Sprite::from_color(palette::FACTORY_CORE, CORE_SIZE),
+                    Transform::from_xyz(0.0, 0.0, Z_CORE),
+                ),
+                crate::turret::barrel_for(FACTORY_MUZZLE),
+            ],
         ));
     }
 }

@@ -10,6 +10,7 @@
 //! - [`DinochromePlugin`] — both of the above; what `main` adds.
 
 pub mod camera;
+pub mod drone;
 pub mod factory;
 pub mod maze;
 pub mod menu;
@@ -49,6 +50,7 @@ impl Plugin for SimPlugin {
                 (
                     player::despawn_tank,
                     despawn_all::<factory::Factory>,
+                    despawn_all::<drone::Drone>,
                     despawn_all::<weapon::Shell>,
                 ),
             )
@@ -72,6 +74,7 @@ impl Plugin for SimPlugin {
                         .run_if(in_state(AppState::Playing).or_else(in_state(AppState::Paused))),
                     state::quit_to_menu.run_if(in_state(AppState::Paused)),
                     state::leave_level_complete.run_if(in_state(AppState::LevelComplete)),
+                    state::leave_game_over.run_if(in_state(AppState::GameOver)),
                 ),
             )
             // `RunFixedMainLoop` runs *before* `Update`, so sampling input in
@@ -90,17 +93,29 @@ impl Plugin for SimPlugin {
                     .run_if(in_state(AppState::Playing)),
             )
             // One tick, in a fixed order, so the simulation is reproducible rather
-            // than merely correct. Shells move before the gun fires, so a shell
-            // spends its first tick sitting at the muzzle where the player can see
-            // it leave; and the dead are reaped after the shells have landed, so a
-            // factory destroyed this tick is gone this tick.
+            // than merely correct.
+            //
+            // The shape of it is: everything decides what it wants (the two AI
+            // systems), then everything moves, then everything shoots, then the
+            // dead are counted. Shells move before the guns fire, so a shell spends
+            // its first tick sitting at the muzzle where the player can see it
+            // leave. The reaping comes after the shells have landed, so a factory
+            // destroyed this tick is gone this tick.
+            //
+            // A tank that dies on the same tick as the last factory has cleared the
+            // sector: the win is checked last and gets the final word.
             .add_systems(
                 FixedUpdate,
                 (
-                    player::move_tanks,
+                    drone::steer_drones,
+                    factory::aim_defences,
+                    player::move_hulls,
                     turret::slew_turrets,
                     weapon::move_shells,
                     weapon::fire_weapons,
+                    factory::build_drones,
+                    drone::destroy_dead_drones,
+                    player::end_run_when_the_tank_dies,
                     factory::destroy_dead_factories,
                 )
                     .chain()
@@ -139,11 +154,14 @@ impl Plugin for PresentationPlugin {
                 OnExit(AppState::LevelComplete),
                 despawn_all::<menu::LevelCompleteUi>,
             )
+            .add_systems(OnEnter(AppState::GameOver), menu::spawn_game_over_overlay)
+            .add_systems(OnExit(AppState::GameOver), despawn_all::<menu::GameOverUi>)
             .add_systems(
                 Update,
                 (
                     player::attach_tank_sprite,
                     weapon::attach_shell_sprites,
+                    drone::attach_drone_sprites,
                     factory::attach_factory_sprites,
                     factory::show_factory_damage,
                     turret::sync_barrels,

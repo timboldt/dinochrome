@@ -247,7 +247,7 @@ pub fn hit_circle(
 /// ray enters the inflated *square*; if that happens level with one of the faces
 /// it is the answer, and if it happens off the end of both then the real contact
 /// is against a rounded corner, which is a ray/circle solve.
-fn hit_box(from: Vec2, delta: Vec2, radius: f32, min: Vec2, max: Vec2) -> Option<f32> {
+pub(crate) fn hit_box(from: Vec2, delta: Vec2, radius: f32, min: Vec2, max: Vec2) -> Option<f32> {
     let grown_min = min - Vec2::splat(radius);
     let grown_max = max + Vec2::splat(radius);
 

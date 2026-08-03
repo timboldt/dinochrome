@@ -11,18 +11,51 @@
 //! special case.
 //!
 //! Finding those candidates is a linear scan over everything with a [`Health`], run
-//! once per shell. At M2's handful of shells and four factories that is nothing; by
-//! the time M3's drones make the product large enough to care about, the fix is a
-//! broad-phase over the grid the maze is already stored in, not a change to any of
-//! the geometry here.
+//! once per shell. With M3's drone caps that is at most a couple of dozen targets
+//! against a handful of shells in the air, which is still nothing; the fix when it
+//! stops being nothing is a broad phase over the grid the maze is already stored
+//! in, not a change to any of the geometry here.
+//!
+//! # Whose shell is whose
+//!
+//! Every gun and every target carries a [`Faction`], and a shell inherits its
+//! shooter's. A shell passes straight through anything on its own side, which is
+//! what lets a factory shoot over the drones it built and a drone fire down a
+//! corridor with two others in it. Walls make no such distinction — every shell
+//! stops on those.
 
 use bevy::prelude::*;
 use dinochrome_core::{FIXED_DT, collision, health, weapon};
 
 use crate::maze::Maze;
 use crate::player::{GridCollider, Velocity};
-use crate::turret::{MUZZLE_OFFSET, Turret};
+use crate::turret::Turret;
 use crate::{palette, player};
+
+/// Which side of the war something is on.
+///
+/// Guns, targets and shells all carry one. It decides exactly one thing — whether
+/// a shell may hurt what it touches — and deliberately nothing else, so that
+/// "hostile" stays a fact about a shell rather than a second place for behaviour
+/// to live.
+#[derive(Component, Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum Faction {
+    /// The player's tank and everything it fires.
+    #[default]
+    Player,
+    /// Factories, drones, and everything they fire.
+    Hostile,
+}
+
+/// How far this entity's muzzle is from its centre, in pixels.
+///
+/// Per entity rather than a constant, because a drone is a third of the tank's
+/// size and a shell appearing a tank's barrel-length away from a small one would
+/// look like it came from nowhere. Far enough out that a round is visibly leaving
+/// the barrel; [`fire_weapons`] sweeps to it, so it can never put a shell through
+/// a wall the shooter is nose-up against.
+#[derive(Component, Debug, Deref, DerefMut)]
+pub struct Muzzle(pub f32);
 
 /// A gun, and how long until it can fire again.
 #[derive(Component, Debug, Default, Deref, DerefMut)]
@@ -35,8 +68,8 @@ pub struct FireCommand(pub bool);
 /// How much punishment an entity can still take.
 ///
 /// Anything carrying this is a target: [`move_shells`] damages whatever it hits
-/// that has one. In M2 that is the factories; in M3 it is the player and the
-/// drones as well.
+/// that has one and is not on its own side. That is the tank, the factories and
+/// every drone.
 #[derive(Component, Debug, Deref, DerefMut)]
 pub struct Health(pub health::Health);
 
@@ -83,13 +116,23 @@ pub fn clear_fire_input(mut shooters: Query<&mut FireCommand>) {
     }
 }
 
+/// Every gun on the field: the tank's, the drones', and the factories'.
+type Shooters<'w, 's> = Query<
+    'w,
+    's,
+    (
+        &'static Transform,
+        &'static Turret,
+        &'static mut Weapon,
+        &'static FireCommand,
+        &'static Muzzle,
+        &'static Faction,
+    ),
+>;
+
 /// Ticks every gun's cooldown and spawns a shell for each one that fired.
-pub fn fire_weapons(
-    mut commands: Commands,
-    maze: Res<Maze>,
-    mut shooters: Query<(&Transform, &Turret, &mut Weapon, &FireCommand)>,
-) {
-    for (transform, turret, mut weapon, trigger) in &mut shooters {
+pub fn fire_weapons(mut commands: Commands, maze: Res<Maze>, mut shooters: Shooters) {
+    for (transform, turret, mut weapon, trigger, muzzle, faction) in &mut shooters {
         // The cooldown runs down whether or not the trigger is held, so letting go
         // of it is never a way to reload faster.
         weapon.tick(FIXED_DT);
@@ -100,34 +143,63 @@ pub fn fire_weapons(
         let params = weapon.params();
         let heading = Vec2::from_angle(turret.0);
         let from = transform.translation.truncate();
-        // Normally the muzzle is out at the end of the barrel. With the tank
+        // Normally the muzzle is out at the end of the barrel. With the shooter
         // nose-in against a wall it is inside that wall, and sweeping to it puts
         // the shell wherever it actually fits — flush against the wall, which it
         // then hits on its first tick. Firing into a wall you are touching is
         // allowed to be a wasted shell; it is not allowed to spawn one inside the
         // masonry.
-        let muzzle = collision::sweep(&maze.grid, from, SHELL_RADIUS, heading * MUZZLE_OFFSET);
+        let at = collision::sweep(&maze.grid, from, SHELL_RADIUS, heading * muzzle.0);
 
         commands.spawn((
             Shell {
                 damage: params.damage,
                 range_left: params.range,
             },
+            *faction,
             Velocity(heading * params.shell_speed),
             GridCollider(SHELL_RADIUS),
-            Transform::from_xyz(muzzle.position.x, muzzle.position.y, Z_SHELL),
+            Transform::from_xyz(at.position.x, at.position.y, Z_SHELL),
         ));
     }
 }
+
+/// Shells in flight.
+type Shells<'w, 's> = Query<
+    'w,
+    's,
+    (
+        Entity,
+        &'static mut Transform,
+        &'static Velocity,
+        &'static GridCollider,
+        &'static mut Shell,
+        &'static Faction,
+    ),
+>;
+
+/// Everything a shell could hurt.
+type Targets<'w, 's> = Query<
+    'w,
+    's,
+    (
+        Entity,
+        &'static Transform,
+        &'static GridCollider,
+        &'static mut Health,
+        &'static Faction,
+    ),
+    Without<Shell>,
+>;
 
 /// Advances every shell by one tick, and applies what it ran into.
 pub fn move_shells(
     mut commands: Commands,
     maze: Res<Maze>,
-    mut shells: Query<(Entity, &mut Transform, &Velocity, &GridCollider, &mut Shell)>,
-    mut targets: Query<(Entity, &Transform, &GridCollider, &mut Health), Without<Shell>>,
+    mut shells: Shells,
+    mut targets: Targets,
 ) {
-    for (entity, mut transform, velocity, collider, mut shell) in &mut shells {
+    for (entity, mut transform, velocity, collider, mut shell, side) in &mut shells {
         let from = transform.translation.truncate();
         let full_step = velocity.0 * FIXED_DT;
         let step_length = full_step.length();
@@ -144,7 +216,13 @@ pub fn move_shells(
         // there was no wall — is what the shell actually hit.
         let mut travel = wall.travel;
         let mut struck = None;
-        for (target, at, target_collider, _) in targets.iter() {
+        for (target, at, target_collider, _, target_side) in targets.iter() {
+            // Its own side is not there as far as this shell is concerned, so a
+            // factory can shoot over its drones and a drone down a corridor with
+            // two others in it.
+            if target_side == side {
+                continue;
+            }
             let center = at.translation.truncate();
             if let Some(t) =
                 collision::hit_circle(from, delta, collider.0, center, target_collider.0)
@@ -160,7 +238,7 @@ pub fn move_shells(
         transform.translation.y = end.y;
 
         if let Some(target) = struck {
-            if let Ok((_, _, _, mut health)) = targets.get_mut(target) {
+            if let Ok((_, _, _, mut health, _)) = targets.get_mut(target) {
                 health.damage(shell.damage);
             }
             commands.entity(entity).despawn();
@@ -178,17 +256,22 @@ pub fn move_shells(
     }
 }
 
-/// Gives every shell its sprite.
+/// Shells that have not been drawn yet.
+type UndrawnShells<'w, 's> =
+    Query<'w, 's, (Entity, &'static Faction), (With<Shell>, Without<Sprite>)>;
+
+/// Gives every shell its sprite, in the colour of whoever fired it.
 ///
 /// Presentation, like the tank's: the simulation has to be able to run a firefight
 /// with no renderer attached.
-pub fn attach_shell_sprites(
-    mut commands: Commands,
-    shells: Query<Entity, (With<Shell>, Without<Sprite>)>,
-) {
-    for entity in &shells {
+pub fn attach_shell_sprites(mut commands: Commands, shells: UndrawnShells) {
+    for (entity, faction) in &shells {
+        let color = match faction {
+            Faction::Player => palette::SHELL,
+            Faction::Hostile => palette::HOSTILE_SHELL,
+        };
         commands
             .entity(entity)
-            .insert(Sprite::from_color(palette::SHELL, SHELL_SIZE));
+            .insert(Sprite::from_color(color, SHELL_SIZE));
     }
 }

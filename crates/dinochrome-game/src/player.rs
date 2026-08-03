@@ -7,12 +7,13 @@
 //! what the frame rate is. No simulation system reads `Time::delta`.
 
 use bevy::prelude::*;
-use dinochrome_core::{FIXED_DT, collision, hull, turret, weapon};
+use dinochrome_core::{FIXED_DT, collision, health, hull, turret, weapon};
 
 use crate::factory::{self, Factory};
 use crate::maze::Maze;
-use crate::turret::{AimCommand, Traverse, Turret};
-use crate::weapon::{FireCommand, Weapon};
+use crate::state::AppState;
+use crate::turret::{AimCommand, MUZZLE_OFFSET, Traverse, Turret};
+use crate::weapon::{Faction, FireCommand, Health, Muzzle, Weapon};
 
 /// Marks the player-controlled tank.
 #[derive(Component, Debug, Default)]
@@ -46,11 +47,21 @@ const TANK_RADIUS: f32 = 20.0;
 /// Square and matched to the collider, so what you see is what collides.
 const TANK_SIZE: Vec2 = Vec2::splat(TANK_RADIUS * 2.0);
 
+/// The tank's hit points.
+///
+/// Drone shells do between eight and twelve, so this is somewhere around ten hits
+/// — enough that one wandering drone getting a lucky shot in is a setback rather
+/// than a run ended, and few enough that driving into a room with four of them in
+/// it is a decision.
+const TANK_HEALTH: i32 = 100;
+
 /// Creates the tank on the maze's spawn cell.
 pub fn spawn_tank(mut commands: Commands, maze: Res<Maze>) {
     let at = maze.grid.cell_center(maze.spawn);
     commands.spawn((
         Tank,
+        Faction::Player,
+        Health(health::Health::new(TANK_HEALTH)),
         Velocity::default(),
         DriveCommand::default(),
         Hull(hull::HullParams::TANK),
@@ -61,9 +72,30 @@ pub fn spawn_tank(mut commands: Commands, maze: Res<Maze>) {
         Traverse(turret::TurretParams::TANK),
         AimCommand::default(),
         Weapon(weapon::Weapon::new(weapon::WeaponParams::TANK)),
+        Muzzle(MUZZLE_OFFSET),
         FireCommand::default(),
         Transform::from_xyz(at.x, at.y, 0.0),
     ));
+}
+
+/// Ends the run when the tank is destroyed.
+///
+/// The tank is despawned here rather than left as a wreck, so that nothing keeps
+/// shooting at a corpse and no system has to learn the difference between a live
+/// tank and a dead one. What the player sees is the [`AppState::GameOver`] screen,
+/// which the camera stays put behind.
+pub fn end_run_when_the_tank_dies(
+    mut commands: Commands,
+    tanks: Query<(Entity, &Health), With<Tank>>,
+    mut next: ResMut<NextState<AppState>>,
+) {
+    for (entity, health) in &tanks {
+        if health.is_dead() {
+            info!("unit lost");
+            commands.entity(entity).despawn();
+            next.set(AppState::GameOver);
+        }
+    }
 }
 
 /// Removes the tank when the run ends.
@@ -110,15 +142,20 @@ pub fn clear_drive_input(mut tanks: Query<&mut DriveCommand>) {
     }
 }
 
-/// Advances every tank by one simulation tick.
+/// Advances every driven hull by one simulation tick.
+///
+/// The tank and every drone go through this, and nothing here knows which is
+/// which: a drone differs from the tank in what writes its [`DriveCommand`] and in
+/// the numbers in its [`Hull`], not in how it moves. That is what keeps there from
+/// being two collision implementations to keep in step.
 ///
 /// Factories are buildings the maze grid knows nothing about, so they come in
 /// separately — the `Without<Factory>` is what proves to Bevy that this
 /// `&mut Transform` and the factories' `&Transform` can never be the same entity.
-pub fn move_tanks(
+pub fn move_hulls(
     maze: Res<Maze>,
     factories: Query<(&Transform, &GridCollider), With<Factory>>,
-    mut tanks: Query<
+    mut hulls: Query<
         (
             &mut Transform,
             &mut Velocity,
@@ -130,7 +167,7 @@ pub fn move_tanks(
     >,
 ) {
     let blockers = factory::blockers(&factories);
-    for (mut transform, mut velocity, command, params, collider) in &mut tanks {
+    for (mut transform, mut velocity, command, params, collider) in &mut hulls {
         velocity.0 = hull::step_velocity(velocity.0, command.0, params.0, FIXED_DT);
 
         let from = transform.translation.truncate();

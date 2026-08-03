@@ -18,14 +18,16 @@ use bevy::input::{ButtonState, InputPlugin};
 use bevy::prelude::*;
 use bevy::state::app::StatesPlugin;
 use bevy::time::TimeUpdateStrategy;
+use dinochrome_core::DroneKind;
 use dinochrome_core::maze::MazeParams;
 use dinochrome_core::weapon::WeaponParams;
-use dinochrome_core::{CELL_SIZE, WALL_THICKNESS, collision};
-use dinochrome_game::factory::{FACTORY_RADIUS, Factory};
+use dinochrome_core::{CELL_SIZE, WALL_THICKNESS, collision, path};
+use dinochrome_game::drone::{self, DRONE_RADIUS, Drone};
+use dinochrome_game::factory::{FACTORY_RADIUS, Factory, LIVE_CAP};
 use dinochrome_game::maze::{Maze, MazeConfig};
 use dinochrome_game::player::{DriveCommand, Tank, Velocity};
 use dinochrome_game::turret::Turret;
-use dinochrome_game::weapon::{Health, SHELL_RADIUS, Shell};
+use dinochrome_game::weapon::{Faction, Health, SHELL_RADIUS, Shell};
 use dinochrome_game::{AppState, SimPlugin};
 
 /// The tank's collider radius, as `player` sets it.
@@ -48,6 +50,7 @@ fn arena() -> MazeConfig {
             ..MazeParams::LEVEL_ONE
         },
         seed: Some(1),
+        ..default()
     }
 }
 
@@ -67,6 +70,25 @@ fn real_maze(seed: u64) -> MazeConfig {
     MazeConfig {
         params: MazeParams::LEVEL_ONE,
         seed: Some(seed),
+        ..default()
+    }
+}
+
+/// A real maze's walls with nothing hostile standing in them.
+///
+/// What the collision tests want. They drive and shoot for twenty seconds to find
+/// out whether the geometry ever lets something through a wall, and a factory
+/// shooting back would eventually end the run and take the tank out from under the
+/// assertion — which would be a test failing for a reason that has nothing to do
+/// with what it is about.
+fn empty_maze(seed: u64) -> MazeConfig {
+    MazeConfig {
+        params: MazeParams {
+            factories: 0,
+            ..MazeParams::LEVEL_ONE
+        },
+        seed: Some(seed),
+        ..default()
     }
 }
 
@@ -243,6 +265,19 @@ fn factory_centers(app: &mut App) -> Vec<Vec2> {
 fn factory_health(app: &mut App) -> i32 {
     let mut query = app.world_mut().query_filtered::<&Health, With<Factory>>();
     query.iter(app.world()).map(|health| health.current()).sum()
+}
+
+/// How many of the shells in the air are the player's.
+///
+/// Factories shoot back, so "a shell exists" stopped being the same question as
+/// "the tank fired" the moment M3 armed them. Tests about the tank's gun ask this
+/// one.
+fn player_shells(app: &mut App) -> usize {
+    let mut query = app.world_mut().query_filtered::<&Faction, With<Shell>>();
+    query
+        .iter(app.world())
+        .filter(|faction| **faction == Faction::Player)
+        .count()
 }
 
 /// Where every shell in flight is.
@@ -495,7 +530,7 @@ fn the_tank_slides_along_a_wall_it_is_pushed_into_at_an_angle() {
 fn a_long_run_through_a_real_maze_never_ends_up_inside_a_wall() {
     // The point of the collision layer, exercised through the real schedule
     // rather than by calling `slide` directly.
-    let mut app = headless_app(real_maze(31337));
+    let mut app = headless_app(empty_maze(31337));
     start_playing(&mut app);
     let grid = app.world().resource::<Maze>().grid.clone();
 
@@ -642,14 +677,10 @@ fn a_shell_takes_a_bite_out_of_a_factory_without_flattening_it() {
     press(&mut app, KeyCode::Space);
     step(&mut app, 1);
     release(&mut app, KeyCode::Space);
-    assert_eq!(
-        count::<Shell>(&mut app),
-        1,
-        "one shell should be in the air"
-    );
+    assert_eq!(player_shells(&mut app), 1, "one shell should be in the air");
 
     step(&mut app, 4);
-    assert_eq!(count::<Shell>(&mut app), 0, "and should have arrived");
+    assert_eq!(player_shells(&mut app), 0, "and should have arrived");
     assert_eq!(count::<Factory>(&mut app), 1, "one shell is not five");
     assert_eq!(factory_health(&mut app), full_health - GUN.damage);
 }
@@ -704,7 +735,7 @@ fn abandoning_a_run_takes_the_factories_and_the_shells_in_flight_with_it() {
 
     press(&mut app, KeyCode::Space);
     step(&mut app, 1);
-    assert_eq!(count::<Shell>(&mut app), 1);
+    assert_eq!(player_shells(&mut app), 1);
     assert_eq!(count::<Factory>(&mut app), 2);
 
     tap(&mut app, KeyCode::Escape);
@@ -816,7 +847,7 @@ fn the_tank_cannot_drive_through_a_factory() {
 fn no_shell_ever_ends_up_inside_a_wall() {
     // What `collision::sweep` is for, exercised through the real schedule: driving
     // and shooting in every direction around a real maze for twenty seconds.
-    let mut app = headless_app(real_maze(31337));
+    let mut app = headless_app(empty_maze(31337));
     start_playing(&mut app);
     let grid = app.world().resource::<Maze>().grid.clone();
 
@@ -838,4 +869,476 @@ fn no_shell_ever_ends_up_inside_a_wall() {
             "tick {tick}: shells are not being cleaned up"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// M3: drones, damage, and the end of a run.
+// ---------------------------------------------------------------------------
+
+/// Hit points left on the tank.
+fn tank_health(app: &mut App) -> i32 {
+    let mut query = app.world_mut().query_filtered::<&Health, With<Tank>>();
+    query.single(app.world()).expect("a live tank").current()
+}
+
+/// Hit points left on a particular entity.
+fn health_of(app: &App, entity: Entity) -> i32 {
+    app.world()
+        .get::<Health>(entity)
+        .expect("the entity has health")
+        .current()
+}
+
+/// Moves any entity, so a test can hold a firing line still.
+///
+/// Drones drive themselves, and a test about what a shell passes through cannot
+/// also be a test about where three moving things drifted to. Pinning them each
+/// tick makes the geometry the fixed part and the shell the only thing in motion.
+fn place_at(app: &mut App, entity: Entity, at: Vec2) {
+    let mut transform = app
+        .world_mut()
+        .get_mut::<Transform>(entity)
+        .expect("the entity has a transform");
+    transform.translation.x = at.x;
+    transform.translation.y = at.y;
+}
+
+/// Puts a drone of `kind` on the field at a world position, owned by nobody.
+///
+/// Factories build drones on a three-and-a-half second timer and pick the kind
+/// from a level's mix, neither of which a test about one kind's behaviour wants to
+/// wait for or argue with. The drone is identical to a built one except that the
+/// factory it names does not exist, which matters only to the production cap.
+fn place_drone(app: &mut App, kind: DroneKind, at: Vec2) -> Entity {
+    let cell = app.world().resource::<Maze>().grid.cell_at(at);
+    let entity = {
+        let mut commands = app.world_mut().commands();
+        drone::spawn(&mut commands, kind, at, cell, Entity::PLACEHOLDER, 0)
+    };
+    app.world_mut().flush();
+    entity
+}
+
+/// Takes the tank off the field.
+///
+/// Production and movement are worth testing without a firefight going on around
+/// them: with nothing to shoot at, drones wander and factories build, which is
+/// exactly the part under test. The simulation is built to cope with this — it is
+/// the state the world is in for the tick between the tank dying and the game-over
+/// screen coming up.
+fn remove_tank(app: &mut App) {
+    let tanks: Vec<Entity> = {
+        let mut query = app.world_mut().query_filtered::<Entity, With<Tank>>();
+        query.iter(app.world()).collect()
+    };
+    for tank in tanks {
+        app.world_mut().despawn(tank);
+    }
+}
+
+/// Which kinds of drone are on the field.
+fn drone_kinds(app: &mut App) -> Vec<DroneKind> {
+    let mut query = app.world_mut().query::<&Drone>();
+    let mut kinds: Vec<DroneKind> = query.iter(app.world()).map(|drone| drone.kind).collect();
+    kinds.sort_by_key(|kind| kind.unlock_level());
+    kinds.dedup();
+    kinds
+}
+
+/// Where every drone is.
+fn drone_positions(app: &mut App) -> Vec<Vec2> {
+    let mut query = app.world_mut().query_filtered::<&Transform, With<Drone>>();
+    query
+        .iter(app.world())
+        .map(|transform| transform.translation.truncate())
+        .collect()
+}
+
+#[test]
+fn a_factory_ships_its_first_drone_on_the_interval_and_not_before() {
+    let mut app = headless_app(arena_with_factories(1));
+    start_playing(&mut app);
+    // Nothing to shoot at and nothing shooting back: this is about the timer.
+    remove_tank(&mut app);
+
+    assert_eq!(
+        count::<Drone>(&mut app),
+        0,
+        "a level should not open with a drone already out"
+    );
+
+    // The interval is 3.5 s, which is 210 ticks. Checked either side of it rather
+    // than on it, because a countdown stepped by 1/60 of a second in binary
+    // floating point does not land exactly on zero at the tick you would expect.
+    step(&mut app, 200);
+    assert_eq!(count::<Drone>(&mut app), 0, "too early at 200 ticks");
+
+    step(&mut app, 20);
+    assert_eq!(count::<Drone>(&mut app), 1, "should have shipped by 220");
+}
+
+#[test]
+fn a_factory_stops_building_at_its_cap_and_stays_there() {
+    let mut app = headless_app(arena_with_factories(1));
+    start_playing(&mut app);
+    remove_tank(&mut app);
+
+    // Six drones at one every 3.5 s is 21 s. Run to thirty, so there is a clear
+    // stretch on the end during which the factory is at its cap and trying again
+    // every half second — which is the part that has to *not* produce anything.
+    let mut peak = 0;
+    for tick in 0..1800 {
+        step(&mut app, 1);
+        let live = count::<Drone>(&mut app);
+        peak = peak.max(live);
+        assert!(
+            live <= LIVE_CAP,
+            "tick {tick}: {live} drones out, past the cap of {LIVE_CAP}"
+        );
+    }
+    assert_eq!(peak, LIVE_CAP, "production never reached the cap");
+}
+
+#[test]
+fn a_destroyed_drone_makes_room_for_another() {
+    // The cap has to count what is alive, not what has ever been built. A factory
+    // that stopped for good after six would make clearing a level a matter of
+    // waiting rather than fighting.
+    let mut app = headless_app(arena_with_factories(1));
+    start_playing(&mut app);
+    remove_tank(&mut app);
+
+    step(&mut app, 1400);
+    assert_eq!(count::<Drone>(&mut app), LIVE_CAP, "at the cap");
+
+    let doomed: Vec<Entity> = {
+        let mut query = app.world_mut().query_filtered::<Entity, With<Drone>>();
+        query.iter(app.world()).take(2).collect()
+    };
+    for drone in doomed {
+        app.world_mut().despawn(drone);
+    }
+    assert_eq!(count::<Drone>(&mut app), LIVE_CAP - 2);
+
+    // The factory is at its cap and retrying every half second, so two more are
+    // due within a couple of intervals of the room appearing.
+    step(&mut app, 480);
+    assert_eq!(count::<Drone>(&mut app), LIVE_CAP, "back up to the cap");
+}
+
+#[test]
+fn one_shell_from_the_tank_destroys_a_drone() {
+    let mut app = headless_app(arena());
+    start_playing(&mut app);
+    let center = maze_center(&app);
+    place_tank(&mut app, center);
+    aim_turret(&mut app, 0.0);
+
+    // Straight out along +X, near enough that the shell arrives before the drone
+    // has drifted far, and further than the muzzle so the shell has to fly.
+    place_drone(&mut app, DroneKind::Drone, center + Vec2::new(120.0, 0.0));
+
+    press(&mut app, KeyCode::Space);
+    step(&mut app, 1);
+    release(&mut app, KeyCode::Space);
+    assert_eq!(player_shells(&mut app), 1);
+
+    // 120 px at 640 px/s is under twelve ticks, with the muzzle offset taken off.
+    step(&mut app, 14);
+    assert_eq!(count::<Drone>(&mut app), 0, "the drone should be wreckage");
+    assert_eq!(player_shells(&mut app), 0, "and the shell spent on it");
+}
+
+#[test]
+fn a_drone_shoots_the_tank_and_takes_health_off_it() {
+    let mut app = headless_app(arena());
+    start_playing(&mut app);
+    let center = maze_center(&app);
+    place_tank(&mut app, center);
+    assert_eq!(tank_health(&mut app), 100, "a fresh tank is at full health");
+
+    // A torpedo drone: it holds its fire until it has a shot, so this also proves
+    // it takes one when it has.
+    let drone = place_drone(&mut app, DroneKind::Torpedo, center + Vec2::new(220.0, 0.0));
+
+    // Both held still, so the only thing that has to happen is the drone slewing
+    // onto the bearing and firing. Half a turn of traverse is a second, the
+    // cooldown another 1.4, and the flight is a handful of ticks.
+    for _ in 0..240 {
+        place_tank(&mut app, center);
+        place_at(&mut app, drone, center + Vec2::new(220.0, 0.0));
+        step(&mut app, 1);
+    }
+
+    assert!(tank_health(&mut app) < 100, "the drone never landed a shot");
+    assert_eq!(state(&app), AppState::Playing, "one shell is not a run");
+}
+
+#[test]
+fn a_shell_passes_straight_through_its_own_side() {
+    // A factory shooting over its own drones, and a drone firing down a corridor
+    // with two others in it, both depend on this. Set up as a firing line: the
+    // shooter at one end, the tank at the other, and one of the shooter's own kind
+    // sitting exactly in the middle of it.
+    let mut app = headless_app(arena());
+    start_playing(&mut app);
+    let center = maze_center(&app);
+    let shooter_at = center + Vec2::new(250.0, 0.0);
+    let bystander_at = center + Vec2::new(125.0, 0.0);
+
+    place_tank(&mut app, center);
+    let shooter = place_drone(&mut app, DroneKind::Torpedo, shooter_at);
+    let bystander = place_drone(&mut app, DroneKind::Torpedo, bystander_at);
+    let bystander_health = health_of(&app, bystander);
+
+    for _ in 0..240 {
+        place_tank(&mut app, center);
+        place_at(&mut app, shooter, shooter_at);
+        place_at(&mut app, bystander, bystander_at);
+        step(&mut app, 1);
+    }
+
+    assert!(
+        tank_health(&mut app) < 100,
+        "the shell should have reached the tank through its own side"
+    );
+    assert_eq!(
+        health_of(&app, bystander),
+        bystander_health,
+        "and should not have touched the drone standing in the way"
+    );
+}
+
+#[test]
+fn a_hunter_closes_on_the_tank() {
+    let mut app = headless_app(arena());
+    start_playing(&mut app);
+    let center = maze_center(&app);
+    place_tank(&mut app, center);
+
+    let start = center + Vec2::new(400.0, 0.0);
+    let hunter = place_drone(&mut app, DroneKind::Hunter, start);
+
+    // Four seconds. A hunter does 130 px/s, so 400 px is well inside what it can
+    // cover — the assertion is about it going the right way, not about its speed.
+    for _ in 0..240 {
+        place_tank(&mut app, center);
+        step(&mut app, 1);
+    }
+
+    let at = app
+        .world()
+        .get::<Transform>(hunter)
+        .expect("the hunter is still alive")
+        .translation
+        .truncate();
+    assert!(
+        at.distance(center) < start.distance(center) * 0.5,
+        "the hunter closed nothing: {} px away, from {}",
+        at.distance(center),
+        start.distance(center)
+    );
+}
+
+#[test]
+fn no_drone_ever_ends_up_inside_a_wall() {
+    // The counterpart to the tank's version of this test. Drones go through the
+    // same collision code, but they are steered by something with no idea where
+    // the walls are, so they lean on it far harder than a player does.
+    let mut app = headless_app(empty_maze(7717));
+    start_playing(&mut app);
+    let grid = app.world().resource::<Maze>().grid.clone();
+    // With nothing to hunt, every kind falls back on wandering — which is the
+    // steering that actually drives into things.
+    remove_tank(&mut app);
+
+    for (index, cell) in grid.open().step_by(37).enumerate() {
+        let kind = DroneKind::ALL[index % DroneKind::ALL.len()];
+        place_drone(&mut app, kind, grid.cell_center(cell));
+    }
+    assert!(count::<Drone>(&mut app) > 4, "a decent crowd of them");
+
+    for tick in 0..1200 {
+        step(&mut app, 1);
+        for at in drone_positions(&mut app) {
+            assert!(
+                collision::is_clear(&grid, at, DRONE_RADIUS),
+                "tick {tick}: a drone is inside a wall at {at:?}"
+            );
+        }
+    }
+}
+
+/// Parks the tank `distance` px from the level's only factory for `ticks`, and
+/// reports the health it had left.
+///
+/// A fresh app each time, and never for longer than the 210 ticks a factory takes
+/// to ship its first drone, so that the factory's own gun is the only thing that
+/// can have fired. Held in place rather than driven, because what is being
+/// measured is the factory's reach and not the tank's ability to stay put.
+fn health_after_loitering(distance: f32, ticks: u32) -> i32 {
+    let mut app = headless_app(arena_with_factories(1));
+    start_playing(&mut app);
+    let factory = factory_centers(&mut app)[0];
+    let spot = factory + (maze_center(&app) - factory).normalize() * distance;
+
+    for _ in 0..ticks {
+        place_tank(&mut app, spot);
+        step(&mut app, 1);
+    }
+    assert_eq!(
+        count::<Drone>(&mut app),
+        0,
+        "the window has to close before the first drone ships"
+    );
+    tank_health(&mut app)
+}
+
+#[test]
+fn a_factory_shoots_back_at_close_range_and_ignores_you_at_long() {
+    // Two hundred ticks is over three seconds: enough for the slowest half-turn of
+    // traverse this gun can be asked for, and a shot after it. Well short of the
+    // 210 the production line needs, so nothing else is armed yet.
+    assert_eq!(
+        health_after_loitering(700.0, 200),
+        100,
+        "a factory should be no threat from across the map"
+    );
+    assert!(
+        health_after_loitering(60.0, 200) < 100,
+        "a factory should defend itself against someone parked on its doorstep"
+    );
+}
+
+#[test]
+fn the_tank_running_out_of_health_ends_the_run() {
+    let mut app = headless_app(arena_with_factories(1));
+    start_playing(&mut app);
+    let factory = factory_centers(&mut app)[0];
+    let near = factory + (maze_center(&app) - factory).normalize() * 60.0;
+
+    // Parked on the doorstep and never moved. A hundred hit points against twelve
+    // a shell is nine of them, plus whatever the drones it is building add.
+    // The tank is despawned on the tick its death is noticed, and the state
+    // transition that follows is applied on the next one — so "still playing" is
+    // not on its own enough to know there is still a tank to reposition.
+    for _ in 0..3000 {
+        if state(&app) != AppState::Playing || tank_count(&mut app) == 0 {
+            break;
+        }
+        place_tank(&mut app, near);
+        step(&mut app, 1);
+    }
+    step(&mut app, 2);
+
+    assert_eq!(state(&app), AppState::GameOver);
+    assert_eq!(tank_count(&mut app), 0, "the tank does not outlive the run");
+}
+
+#[test]
+fn a_lost_run_stands_down_to_the_menu_with_nothing_left_behind() {
+    let mut app = headless_app(arena_with_factories(1));
+    start_playing(&mut app);
+    let factory = factory_centers(&mut app)[0];
+    let near = factory + (maze_center(&app) - factory).normalize() * 60.0;
+
+    // The tank is despawned on the tick its death is noticed, and the state
+    // transition that follows is applied on the next one — so "still playing" is
+    // not on its own enough to know there is still a tank to reposition.
+    for _ in 0..3000 {
+        if state(&app) != AppState::Playing || tank_count(&mut app) == 0 {
+            break;
+        }
+        place_tank(&mut app, near);
+        step(&mut app, 1);
+    }
+    step(&mut app, 2);
+    assert_eq!(state(&app), AppState::GameOver);
+
+    tap(&mut app, KeyCode::Enter);
+    assert_eq!(state(&app), AppState::MainMenu);
+    assert_eq!(count::<Factory>(&mut app), 0);
+    assert_eq!(count::<Drone>(&mut app), 0, "drones belong to the run");
+    assert_eq!(count::<Shell>(&mut app), 0);
+}
+
+#[test]
+fn the_level_decides_which_kinds_get_built() {
+    // Level one builds nothing but the dumbest kind; the mix opens up as the
+    // levels go on. What is being checked here is the plumbing — that the level
+    // reaches `kind_at` at all — since the shape of the table is core's business.
+    let mut app = headless_app(arena_with_factories(2));
+    start_playing(&mut app);
+    remove_tank(&mut app);
+    step(&mut app, 1400);
+    assert_eq!(
+        drone_kinds(&mut app),
+        vec![DroneKind::Drone],
+        "level one has unlocked nothing else"
+    );
+
+    let mut later = headless_app(MazeConfig {
+        level: 4,
+        ..arena_with_factories(4)
+    });
+    start_playing(&mut later);
+    remove_tank(&mut later);
+    step(&mut later, 3000);
+    let kinds = drone_kinds(&mut later);
+    assert!(
+        kinds.len() > 1,
+        "level four should be building a mix, got {kinds:?}"
+    );
+    assert!(
+        kinds.iter().all(|kind| kind.unlock_level() <= 4),
+        "nothing should be built before its level: {kinds:?}"
+    );
+}
+
+#[test]
+fn an_assassin_finds_its_way_to_the_tank_across_a_real_maze() {
+    // The one thing in M3 that no amount of driving at the player would achieve:
+    // an assassin starts at the far end of the maze, behind however many walls the
+    // seed put there, and arrives. Measured in A* steps rather than in pixels,
+    // because straight-line distance is exactly the thing walls make a lie.
+    let mut app = headless_app(empty_maze(5150));
+    start_playing(&mut app);
+    let grid = app.world().resource::<Maze>().grid.clone();
+    let home = app.world().resource::<Maze>().spawn;
+    let tank_at = grid.cell_center(home);
+    place_tank(&mut app, tank_at);
+
+    let steps_home = |cell| {
+        path::find_path(&grid, cell, home)
+            .map(|route| route.steps())
+            .expect("a generated maze is all one piece")
+    };
+    let far = grid.open().max_by_key(|cell| steps_home(*cell)).unwrap();
+    let started = steps_home(far);
+    assert!(
+        started > 20,
+        "the far corner should be a real trek: {started}"
+    );
+
+    place_drone(&mut app, DroneKind::Assassin, grid.cell_center(far));
+
+    // Held still, so this measures the assassin's navigation and not the player's
+    // inability to run away. It shoots as well as it drives, so the loop ends when
+    // the tank does — by then the closest approach has already been recorded.
+    let mut closest = started;
+    for _ in 0..1800 {
+        if state(&app) != AppState::Playing || tank_count(&mut app) == 0 {
+            break;
+        }
+        place_tank(&mut app, tank_at);
+        step(&mut app, 1);
+        if let Some(at) = drone_positions(&mut app).first() {
+            closest = closest.min(steps_home(grid.cell_at(*at)));
+        }
+    }
+
+    assert!(
+        closest <= 2,
+        "the assassin got no closer than {closest} steps, having started {started} away"
+    );
 }

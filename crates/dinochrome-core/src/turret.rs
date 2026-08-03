@@ -33,6 +33,12 @@ impl TurretParams {
     /// come round a corner, slow enough that turning to face the other way is a
     /// decision with a cost.
     pub const TANK: Self = Self { traverse: PI };
+
+    /// Traverse for a factory's defence gun.
+    ///
+    /// Slower than a tank's, because a building should be beatable by moving. A
+    /// player who circles one faster than it can follow has earned the shot.
+    pub const FACTORY: Self = Self { traverse: PI * 0.6 };
 }
 
 impl Default for TurretParams {

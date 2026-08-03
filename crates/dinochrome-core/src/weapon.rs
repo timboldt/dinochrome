@@ -32,6 +32,23 @@ impl WeaponParams {
         range: 576.0,
         damage: 20,
     };
+
+    /// A factory's close-in defence gun.
+    ///
+    /// A factory is a stationary target that builds the things trying to stop you
+    /// reaching it, which makes parking outside its front door and shooting it at
+    /// leisure the obvious degenerate strategy. This is the answer to that: short
+    /// ranged, so it is no threat at all to a player working at a distance, and
+    /// hard-hitting, so standing on top of one is not free.
+    ///
+    /// Four cells of reach against the tank's nine. You can always out-range it;
+    /// the price is that you have to aim from further away.
+    pub const FACTORY: Self = Self {
+        shell_speed: 420.0,
+        cooldown: 1.6,
+        range: 256.0,
+        damage: 12,
+    };
 }
 
 impl Default for WeaponParams {

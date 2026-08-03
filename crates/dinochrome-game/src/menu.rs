@@ -16,6 +16,10 @@ pub struct PauseUi;
 #[derive(Component)]
 pub struct LevelCompleteUi;
 
+/// Marks entities belonging to the game-over overlay.
+#[derive(Component)]
+pub struct GameOverUi;
+
 /// A full-screen, centred, vertically stacked overlay root.
 fn overlay_root(background: Color) -> impl Bundle {
     (
@@ -100,6 +104,25 @@ pub fn spawn_level_complete_overlay(mut commands: Commands) {
                 palette::PHOSPHOR,
             ),
             line("ENTER or SPACE to stand down", palette::PHOSPHOR_DIM),
+        ],
+    ));
+}
+
+/// The dispatch that comes in when the tank does not.
+///
+/// Amber rather than the hostile red, because this is the Brigade talking, not the
+/// thing that killed you.
+pub fn spawn_game_over_overlay(mut commands: Commands) {
+    commands.spawn((
+        GameOverUi,
+        overlay_root(palette::SCRIM),
+        children![
+            heading("UNIT LOST", palette::AMBER),
+            line(
+                "Brigade to sector: contact lost. The factories are still standing.",
+                palette::PHOSPHOR,
+            ),
+            line("ENTER or SPACE to return to command", palette::PHOSPHOR_DIM),
         ],
     ));
 }

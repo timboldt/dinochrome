@@ -12,15 +12,21 @@
 //! [`Vec2`]: glam::Vec2
 
 pub mod collision;
+pub mod drone;
 pub mod grid;
 pub mod health;
 pub mod hull;
+pub mod los;
 pub mod maze;
+pub mod path;
+pub mod rng;
 pub mod turret;
 pub mod weapon;
 
+pub use drone::{DroneKind, DroneParams};
 pub use grid::{Aabb, CELL_SIZE, Cell, Grid, WALL_THICKNESS, WallShape};
 pub use maze::{Maze, MazeParams};
+pub use rng::SimRng;
 
 /// Simulation tick rate, in hertz.
 ///

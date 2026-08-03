@@ -47,6 +47,7 @@ fn app() -> App {
     .insert_resource(MazeConfig {
         params: MazeParams::LEVEL_ONE,
         seed: Some(20260729),
+        ..default()
     })
     .insert_resource(TimeUpdateStrategy::FixedTimesteps(1));
     app.update();
@@ -232,21 +233,32 @@ fn the_tank_gets_one_barrel_and_it_points_where_the_turret_does() {
     let mut app = app();
     tap(&mut app, KeyCode::Enter);
     step(&mut app, 2);
-    assert_eq!(count::<Barrel>(&mut app), 1, "exactly one barrel");
 
-    // A barrel that is not a child of the tank would not travel with it.
+    // Factories carry a barrel too — they shoot back — so "the tank's barrel" has
+    // to be found by parentage rather than by being the only one on the field. A
+    // barrel that is not a child of the tank would not travel with it anyway,
+    // which is the thing actually worth asserting.
     let tank = {
         let mut query = app.world_mut().query_filtered::<Entity, With<Tank>>();
         query.single(app.world()).expect("one tank")
     };
-    let mut query = app.world_mut().query_filtered::<&ChildOf, With<Barrel>>();
-    let parent = query.single(app.world()).expect("one barrel").parent();
-    assert_eq!(parent, tank);
+    let mut query = app
+        .world_mut()
+        .query_filtered::<(&ChildOf, Entity), With<Barrel>>();
+    let barrels: Vec<Entity> = query
+        .iter(app.world())
+        .filter(|(parent, _)| parent.parent() == tank)
+        .map(|(_, barrel)| barrel)
+        .collect();
+    assert_eq!(barrels.len(), 1, "exactly one barrel on the tank");
 
     aim_turret(&mut app, FRAC_PI_2);
     step(&mut app, 1);
-    let mut query = app.world_mut().query_filtered::<&Transform, With<Barrel>>();
-    let rotation = query.single(app.world()).expect("one barrel").rotation;
+    let rotation = app
+        .world()
+        .get::<Transform>(barrels[0])
+        .expect("the barrel has a transform")
+        .rotation;
     // The barrel is drawn along its own +X, so rotating +X by it is the bearing it
     // is showing.
     let showing = (rotation * Vec3::X).truncate().to_angle();

@@ -276,6 +276,18 @@ impl Grid {
         ORTHOGONAL.iter().any(|step| self.is_open(cell + *step))
     }
 
+    /// Iterates the open orthogonal neighbours of `cell`, in [`ORTHOGONAL`] order.
+    ///
+    /// Fixed order rather than whatever is convenient, because pathfinding and
+    /// drone steering both break ties by taking the first one and the simulation
+    /// has to be reproducible from a seed.
+    pub fn open_neighbours(&self, cell: IVec2) -> impl Iterator<Item = IVec2> + '_ {
+        ORTHOGONAL
+            .into_iter()
+            .map(move |step| cell + step)
+            .filter(|next| self.is_open(*next))
+    }
+
     /// Counts the open cells reachable from `start` by orthogonal steps.
     ///
     /// Returns zero if `start` is itself a wall.

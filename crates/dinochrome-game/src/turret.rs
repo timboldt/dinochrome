@@ -41,21 +41,29 @@ pub struct Barrel;
 /// appearing out of the middle of the tank.
 pub const MUZZLE_OFFSET: f32 = 28.0;
 
-/// Size of the barrel sprite, in pixels.
-const BARREL_SIZE: Vec2 = Vec2::new(MUZZLE_OFFSET, 6.0);
+/// How wide a barrel is drawn, in pixels. The length comes from the muzzle it
+/// reaches to.
+const BARREL_WIDTH: f32 = 6.0;
 
 /// Draw order for the barrel, relative to the hull it is a child of.
 const Z_BARREL: f32 = 0.1;
 
-/// The barrel sprite, as a child of the tank it belongs to.
+/// The tank's barrel sprite, as a child of the tank it belongs to.
+pub fn barrel() -> impl Bundle {
+    barrel_for(MUZZLE_OFFSET)
+}
+
+/// A barrel sprite reaching out to a muzzle `length` from the centre.
 ///
 /// Anchored at its left edge rather than its centre, so the child's own transform
 /// needs nothing but the turret's rotation: the rectangle then grows out of the
-/// tank's centre along +X, which is the bearing zero means.
-pub fn barrel() -> impl Bundle {
+/// parent's centre along +X, which is the bearing zero means. Drawn to exactly the
+/// muzzle its owner fires from, so a drone's stubby gun and the tank's long one
+/// both tell the truth about where their shells appear.
+pub fn barrel_for(length: f32) -> impl Bundle {
     (
         Barrel,
-        Sprite::from_color(palette::TURRET, BARREL_SIZE),
+        Sprite::from_color(palette::TURRET, Vec2::new(length, BARREL_WIDTH)),
         Anchor::CENTER_LEFT,
         Transform::from_xyz(0.0, 0.0, Z_BARREL),
     )
